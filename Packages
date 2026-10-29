@@ -1,0 +1,15 @@
+Package: demo
+Version: 1.0
+Architecture: amd64
+Depends: libc6 (>= 2.35), zlib1g
+Description: demo package
+
+Package: libc6
+Version: 2.35
+Architecture: amd64
+Description: C library
+
+Package: zlib1g
+Version: 1.2.13
+Architecture: amd64
+Description: compression library
