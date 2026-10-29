@@ -1,20 +1,20 @@
-
-"""CLI-инструмент для получения зависимостей пакетов Ubuntu APT."""
-
+"""CLI-инструмент для построения графа зависимостей Ubuntu APT."""
 import argparse
 import gzip
+import json
 import lzma
 import platform
 import re
 import sys
+from collections import deque
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-allowed_extensions = {".png", ".svg", ".jpg", ".jpeg", ".pdf"}
 package_pattern = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+graph_package_pattern = re.compile(r"^[A-Z]+$")
 url_schemes = {"http", "https"}
 dependency_pattern = re.compile(r"^\s*([a-z0-9][a-z0-9+.-]*)")
 
@@ -38,40 +38,18 @@ def repository_value(value: str) -> str:
         raise argparse.ArgumentTypeError(
             "адрес репозитория не может быть пустым"
         )
-
-    if re.match(r"^[A-Za-z]:[\\/]", value):
+    if re.match(r"^[A-Za-z]:[\\/]", value) or "://" not in value:
         return value
-
-    if "://" not in value:
-        return value
-
     parsed = urlparse(value)
     if parsed.scheme not in url_schemes or not parsed.netloc:
         raise argparse.ArgumentTypeError(
             "URL должен начинаться с http:// или https://"
         )
-
-    return value
-
-
-def output_file(value: str) -> str:
-    """Проверяет имя и расширение выходного файла."""
-    path = Path(value)
-    if not value.strip() or path.name in {"", ".", ".."}:
-        raise argparse.ArgumentTypeError("укажите имя выходного файла")
-    if path.suffix.lower() not in allowed_extensions:
-        raise argparse.ArgumentTypeError(
-            "разрешены расширения: .png, .svg, .jpg, .jpeg, .pdf"
-        )
-    if path.exists() and path.is_dir():
-        raise argparse.ArgumentTypeError(
-            "выходной путь указывает на каталог"
-        )
     return value
 
 
 def filter_value(value: str) -> str:
-    """Проверяет подстроку фильтрации."""
+    """Проверяет подстроку для фильтрации пакетов."""
     if not value:
         raise argparse.ArgumentTypeError(
             "подстрока фильтрации не может быть пустой"
@@ -79,167 +57,119 @@ def filter_value(value: str) -> str:
     return value
 
 
-def validate_test_file(parser: argparse.ArgumentParser, value: str) -> None:
-    """Проверяет существование и доступность тестового файла."""
-    path = Path(value)
-    if not path.exists():
-        parser.error(f"тестовый файл не найден: {value}")
-    if not path.is_file():
-        parser.error(f"ожидался файл, получен другой путь: {value}")
-    try:
-        with path.open("rb"):
-            pass
-    except OSError as error:
-        parser.error(f"невозможно прочитать тестовый файл: {error}")
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Создаёт парсер аргументов командной строки."""
     parser = argparse.ArgumentParser(
-        description="Прототип визуализатора зависимостей пакетов.")
+        description="Построение графа зависимостей пакетов."
+    )
     parser.add_argument(
-        "--package",
-        required=True,
-        type=package_name,
-        help="имя анализируемого пакета",)
+        "--package", required=True, type=package_name,
+        help="имя анализируемого пакета",
+    )
     parser.add_argument(
-        "--repository",
-        required=True,
-        type=repository_value,
-        help="URL репозитория, индекс Packages или путь к тестовому файлу",)
+        "--repository", required=True, type=repository_value,
+        help="URL репозитория или путь к локальному файлу",
+    )
     parser.add_argument(
-        "--test-repository",
-        action="store_true",
-        help="использовать локальный тестовый файл",)
+        "--test-repository", action="store_true",
+        help="использовать локальный тестовый файл",
+    )
     parser.add_argument(
-        "--output",
-        default="dependencies.png",
-        type=output_file,
-        help="имя выходного файла", )
-    parser.add_argument(
-        "--ascii-tree",
-        action="store_true",
-        help="включить режим ASCII-дерева",)
-    parser.add_argument(
-        "--filter",
-        dest="package_filter",
-        type=filter_value,
-        help="подстрока для фильтрации пакетов",)
+        "--filter", dest="package_filter", type=filter_value,
+        help="исключить пакеты, содержащие указанную подстроку",
+    )
     return parser
 
 
 def print_options(args: argparse.Namespace) -> None:
-    """Печатает все пользовательские параметры."""
-    values = {
-        "package": args.package,
-        "repository": args.repository,
-        "test_repository": args.test_repository,
-        "output": args.output,
-        "ascii_tree": args.ascii_tree,
-        "filter": args.package_filter or "",
-    }
-    for key, value in values.items():
-        print(f"{key}={value}")
+    """Печатает параметры запуска программы."""
+    print(f"package={args.package}")
+    print(f"repository={args.repository}")
+    print(f"test_repository={args.test_repository}")
+    print(f"filter={args.package_filter or ''}")
 
 
 def parse_control_data(data: str) -> list[dict[str, str]]:
-    """Разбирает записи формата Debian control, используемого APT."""
+    """Разбирает записи Debian control из индекса APT."""
     packages = []
     fields: dict[str, str] = {}
-    last_field: str | None = None
+    last_field = None
+
     def save_record() -> None:
+        """Сохраняет текущую запись и очищает поля."""
         if fields:
             packages.append(dict(fields))
             fields.clear()
+
     for line in data.splitlines():
         if not line.strip():
             save_record()
             last_field = None
-            continue
-        if line[0].isspace():
-            if last_field is not None:
+        elif line[0].isspace():
+            if last_field:
                 fields[last_field] += " " + line.strip()
-            continue
-        if ":" not in line:
+        elif ":" in line:
+            key, value = line.split(":", 1)
+            last_field = key.strip()
+            fields[last_field] = value.strip()
+        else:
             raise RepositoryError(
                 f"некорректная строка в метаданных: {line!r}"
             )
-        key, value = line.split(":", 1)
-        key = key.strip()
-        if not key:
-            raise RepositoryError("обнаружено поле без имени")
-        fields[key] = value.strip()
-        last_field = key
     save_record()
     return packages
 
 
 def extract_dependencies(package: dict[str, str]) -> list[str]:
-    """Извлекает имена прямых Depends и Pre-Depends."""
+    """Извлекает имена прямых зависимостей Debian-пакета."""
     dependencies = []
-    seen = set()
     for field in ("Pre-Depends", "Depends"):
-        value = package.get(field, "")
-        if not value:
-            continue
-        for alternative_group in value.split(","):
-            for alternative in alternative_group.split("|"):
+        for group in package.get(field, "").split(","):
+            for alternative in group.split("|"):
                 match = dependency_pattern.match(alternative)
-                if not match:
-                    continue
-                name = match.group(1)
-                if name not in seen:
-                    seen.add(name)
-                    dependencies.append(name)
+                if match and match.group(1) not in dependencies:
+                    dependencies.append(match.group(1))
     return dependencies
 
 
 def decode_index(raw: bytes, source: str) -> str:
-    """Распаковывает индекс APT в зависимости от расширения."""
+    """Распаковывает индекс APT с учётом расширения файла."""
     try:
         if source.endswith(".gz"):
             raw = gzip.decompress(raw)
         elif source.endswith(".xz"):
             raw = lzma.decompress(raw)
         return raw.decode("utf-8")
-    except (OSError, EOFError, lzma.LZMAError, UnicodeDecodeError) as error:
+    except (OSError, EOFError, lzma.LZMAError, UnicodeDecodeError) as exc:
         raise RepositoryError(
-            f"не удалось прочитать индекс {source}: {error}"
-        ) from error
+            f"не удалось прочитать индекс {source}: {exc}"
+        ) from exc
 
 
 def read_local_repository(path: str) -> str:
-    """Читает локальный индекс пакетов."""
-    file_path = Path(path)
+    """Читает локальный индекс пакетов APT."""
     try:
-        raw = file_path.read_bytes()
-    except OSError as error:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
         raise RepositoryError(
-            f"не удалось прочитать файл репозитория: {error}"
-        ) from error
-
-    return decode_index(raw, file_path.name)
+            f"не удалось прочитать файл репозитория: {exc}"
+        ) from exc
+    return decode_index(raw, Path(path).name)
 
 
 def fetch_url(url: str) -> str:
     """Загружает индекс пакетов по HTTP или HTTPS."""
-    request = Request(
-        url,
-        headers={"User-Agent": "dependency-graph/1.0"},
-    )
+    request = Request(url, headers={"User-Agent": "dependency-graph/1.0"})
     try:
         with urlopen(request, timeout=15) as response:
             raw = response.read()
-    except (HTTPError, URLError, TimeoutError, OSError) as error:
-        raise RepositoryError(
-            f"не удалось загрузить {url}: {error}"
-        ) from error
-
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise RepositoryError(f"не удалось загрузить {url}: {exc}") from exc
     return decode_index(raw, urlparse(url).path)
 
 
 def architecture_name() -> str:
-    """Преобразует архитектуру Python в название архитектуры APT."""
+    """Возвращает архитектуру системы в формате APT."""
     machine = platform.machine().lower()
     return {
         "x86_64": "amd64",
@@ -253,15 +183,16 @@ def architecture_name() -> str:
 
 
 def ubuntu_codename() -> str | None:
-    """Определяет кодовое имя Ubuntu из /etc/os-release, если оно доступно."""
+    """Определяет кодовое имя Ubuntu из системных метаданных."""
     try:
-        for line in Path("/etc/os-release").read_text(
+        lines = Path("/etc/os-release").read_text(
             encoding="utf-8"
-        ).splitlines():
-            if line.startswith("VERSION_CODENAME="):
-                return line.split("=", 1)[1].strip().strip('"')
+        ).splitlines()
     except OSError:
-        pass
+        return None
+    for line in lines:
+        if line.startswith("VERSION_CODENAME="):
+            return line.split("=", 1)[1].strip().strip('"')
     return None
 
 
@@ -269,27 +200,17 @@ def index_urls(repository: str) -> list[str]:
     """Формирует возможные URL индекса Packages."""
     parsed = urlparse(repository)
     base = repository.rstrip("/")
-    path = parsed.path.rstrip("/")
-    filename = path.rsplit("/", 1)[-1]
+    filename = parsed.path.rstrip("/").rsplit("/", 1)[-1]
     if filename in {"Packages", "Packages.gz", "Packages.xz"}:
         return [repository]
     if re.fullmatch(r"binary-[A-Za-z0-9_-]+", filename):
         return [
             f"{base}/Packages.xz",
             f"{base}/Packages.gz",
-            f"{base}/Packages",]
-    if re.fullmatch(r"(main|universe|restricted|multiverse)", filename):
-        architecture = architecture_name()
-        return [
-            f"{base}/binary-{architecture}/Packages.xz",
-            f"{base}/binary-{architecture}/Packages.gz",
-            f"{base}/binary-{architecture}/Packages",
-            f"{base}/binary-all/Packages.xz",
-            f"{base}/binary-all/Packages.gz",
-            f"{base}/binary-all/Packages",]
+            f"{base}/Packages",
+        ]
     suites = []
-    detected = ubuntu_codename()
-    for suite in (detected, "noble", "jammy", "focal"):
+    for suite in (ubuntu_codename(), "noble", "jammy", "focal"):
         if suite and suite not in suites:
             suites.append(suite)
     urls = []
@@ -297,18 +218,19 @@ def index_urls(repository: str) -> list[str]:
     for suite in suites:
         for component in ("main", "universe", "restricted", "multiverse"):
             for arch in (architecture, "all"):
-                directory = (
+                folder = (
                     f"{base}/dists/{suite}/{component}/binary-{arch}"
                 )
                 urls.extend([
-                        f"{directory}/Packages.xz",
-                        f"{directory}/Packages.gz",
-                        f"{directory}/Packages",])
+                    f"{folder}/Packages.xz",
+                    f"{folder}/Packages.gz",
+                    f"{folder}/Packages",
+                ])
     return urls
 
 
 def find_package(data: str, requested_name: str) -> dict[str, str] | None:
-    """Ищет пакет по точному имени в индексе."""
+    """Находит запись пакета по точному имени."""
     for package in parse_control_data(data):
         if package.get("Package") == requested_name:
             return package
@@ -320,7 +242,7 @@ def get_package_dependencies(
     requested_name: str,
     test_repository: bool = False,
 ) -> list[str]:
-    """Получает прямые зависимости пакета из локального или сетевого индекса."""
+    """Получает прямые зависимости пакета из APT."""
     if test_repository:
         data = read_local_repository(repository)
         package = find_package(data, requested_name)
@@ -329,53 +251,152 @@ def get_package_dependencies(
                 f"пакет {requested_name!r} не найден в тестовом репозитории"
             )
         return extract_dependencies(package)
-    urls = index_urls(repository)
     errors = []
+    urls = index_urls(repository)
     for url in urls:
         try:
-            data = fetch_url(url)
-            package = find_package(data, requested_name)
+            package = find_package(fetch_url(url), requested_name)
             if package is not None:
                 return extract_dependencies(package)
-        except RepositoryError as error:
-            errors.append(str(error))
-
+        except RepositoryError as exc:
+            errors.append(str(exc))
     if errors and len(errors) == len(urls):
         raise RepositoryError(
-            "не удалось загрузить ни один индекс пакетов. "
-            "Передайте URL файла Packages или каталога индекса. "
+            "не удалось загрузить индексы Packages. "
             f"Последняя ошибка: {errors[-1]}"
         )
     raise RepositoryError(
-        f"пакет {requested_name!r} не найден в доступных индексах. "
-        "Проверьте URL, выпуск Ubuntu, компонент и архитектуру."
+        f"пакет {requested_name!r} не найден в доступных индексах"
     )
 
 
+def parse_graph_file(path: str) -> dict[str, list[str]]:
+    """Читает JSON-граф с именами пакетов из больших латинских букв."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RepositoryError(f"не удалось прочитать JSON-граф: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RepositoryError("граф должен быть JSON-объектом")
+    graph = {}
+    for name, dependencies in data.items():
+        if (
+            not isinstance(name, str)
+            or not graph_package_pattern.fullmatch(name)
+        ):
+            raise RepositoryError(
+                f"недопустимое имя пакета: {name!r}"
+            )
+            raise RepositoryError(f"недопустимое имя пакета: {name!r}")
+        if not isinstance(dependencies, list):
+            raise RepositoryError(f"зависимости {name} должны быть списком")
+        for dependency in dependencies:
+            if (
+                not isinstance(dependency, str)
+                or not graph_package_pattern.fullmatch(dependency)
+            ):
+                raise RepositoryError(
+                    f"некорректная зависимость пакета {name}"
+                )
+        graph[name] = list(dict.fromkeys(dependencies))
+    return graph
+
+
+def records_to_graph(records: list[dict[str, str]]) -> dict[str, list[str]]:
+    """Преобразует записи APT в словарь зависимостей."""
+    graph = {}
+    for package in records:
+        name = package.get("Package")
+        if name:
+            graph[name] = extract_dependencies(package)
+    return graph
+
+
+def load_test_graph(path: str) -> dict[str, list[str]]:
+    """Загружает JSON-граф или локальный индекс Ubuntu Packages."""
+    try:
+        content = Path(path).read_text(encoding="utf-8").lstrip()
+    except OSError as exc:
+        raise RepositoryError(
+            f"тестовый файл не найден или недоступен: {exc}"
+        ) from exc
+    if content.startswith("{"):
+        return parse_graph_file(path)
+    return records_to_graph(parse_control_data(read_local_repository(path)))
+
+
+def build_dependency_graph(
+    root: str,
+    dependency_provider,
+    package_filter: str = "",
+) -> dict[str, list[str]]:
+    """Строит граф BFS с рекурсивной обработкой очереди."""
+    if package_filter and package_filter in root:
+        raise RepositoryError(
+            f"корневой пакет {root!r} исключён фильтром {package_filter!r}"
+        )
+    graph = {root: []}
+    visited = {root}
+    queue = deque([root])
+
+    def process_queue() -> None:
+        """Обрабатывает очередной узел и рекурсивно продолжает BFS."""
+        if not queue:
+            return
+        current = queue.popleft()
+        for dependency in dependency_provider(current):
+            if package_filter and package_filter in dependency:
+                continue
+            graph[current].append(dependency)
+            if dependency not in visited:
+                visited.add(dependency)
+                graph.setdefault(dependency, [])
+                queue.append(dependency)
+        process_queue()
+
+    process_queue()
+    return graph
+
+
+def print_graph(graph: dict[str, list[str]]) -> None:
+    """Выводит узлы и рёбра графа в текстовом виде."""
+    print("\nГраф зависимостей:")
+    for package, dependencies in graph.items():
+        if dependencies:
+            print(f"{package} -> {', '.join(dependencies)}")
+        else:
+            print(f"{package} -> (нет зависимостей)")
+    print(f"\nКоличество узлов: {len(graph)}")
+    print(f"Количество рёбер: {sum(map(len, graph.values()))}")
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Проверяет параметры и выводит прямые зависимости пакета."""
+    """Разбирает параметры, строит граф и выводит результат."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.test_repository:
-        validate_test_file(parser, args.repository)
     print_options(args)
     try:
-        dependencies = get_package_dependencies(
-            args.repository,
-            args.package,
-            args.test_repository,
+        if args.test_repository:
+            graph_data = load_test_graph(args.repository)
+            if args.package not in graph_data:
+                raise RepositoryError(
+                    f"пакет {args.package!r} не найден в тестовом файле"
+                )
+            provider = lambda name: graph_data.get(name, [])
+        else:
+            get_package_dependencies(
+                args.repository, args.package, False
+            )
+            provider = lambda name: get_package_dependencies(
+                args.repository, name, False
+            )
+        graph = build_dependency_graph(
+            args.package, provider, args.package_filter or ""
         )
-    except RepositoryError as error:
-        print(f"Ошибка: {error}", file=sys.stderr)
+        print_graph(graph)
+    except RepositoryError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
-
-    print(f"\nПрямые зависимости пакета {args.package}:")
-    if dependencies:
-        for dependency in dependencies:
-            print(dependency)
-    else:
-        print("Прямые зависимости отсутствуют.")
-
     return 0
 
 

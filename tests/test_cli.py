@@ -1,202 +1,223 @@
-"""Сценарные тесты CLI."""
 
+"""Сценарные тесты CLI без pytest."""
+
+import json
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
 
 root = Path(__file__).resolve().parents[1]
 app = root / "src" / "dependency_graph.py"
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
-    """Запускает CLI с указанными аргументами."""
+    """Запускает CLI и возвращает результат выполнения."""
     return subprocess.run(
-        [sys.executable, str(app), *args],
+        [sys.executable, str(app), *map(str, args)],
         capture_output=True,
         text=True,
         cwd=root,
+        check=False,
     )
 
 
 def check(condition: bool, message: str) -> None:
-    """Завершает тест с ошибкой при невыполнении условия."""
+    """Вызывает ошибку, если проверяемое условие ложно."""
     if not condition:
         raise AssertionError(message)
 
 
-def test_valid_run(directory: Path) -> None:
-    """Проверяет вывод всех параметров."""
-    repository = directory / "repo.json"
-    repository.write_text('{"packages": []}', encoding="utf-8")
-    output = directory / "graph.svg"
+def write_graph(directory: Path, graph: dict) -> Path:
+    """Сохраняет тестовый граф в формате JSON."""
+    path = directory / "graph.json"
+    path.write_text(json.dumps(graph), encoding="utf-8")
+    return path
+
+
+def test_transitive_dependencies(directory: Path) -> None:
+    """Проверяет поиск прямых и транзитивных зависимостей."""
+    source = write_graph(
+        directory,
+        {"A": ["B", "C"], "B": ["D"], "C": ["D"], "D": []},
+    )
     result = run_cli(
-        "--package", "demo_pkg",
-        "--repository", str(repository),
+        "--package", "A", "--repository", str(source),
         "--test-repository",
-        "--output", str(output),
-        "--ascii-tree",
-        "--filter", "demo",
     )
     check(result.returncode == 0, result.stderr)
-    expected = [
-        "package=demo_pkg",
-        f"repository={repository}",
-        "test_repository=True",
-        f"output={output}",
-        "ascii_tree=True",
-        "filter=demo",
-    ]
-    for line in expected:
-        check(line in result.stdout, f"нет строки: {line}")
+    for edge in ("A -> B, C", "B -> D", "C -> D"):
+        check(edge in result.stdout, f"не найдено ребро: {edge}")
+    check("Количество узлов: 4" in result.stdout, result.stdout)
 
 
-def test_missing_package() -> None:
-    """Проверяет отсутствие обязательного имени пакета."""
-    result = run_cli("--repository", "https://example.com")
-    check(result.returncode != 0, "ожидалась ошибка --package")
-
-
-def test_invalid_package() -> None:
-    """Проверяет недопустимые символы в имени пакета."""
-    result = run_cli(
-        "--package", "bad name",
-        "--repository", "https://example.com",
+def test_cycle(directory: Path) -> None:
+    """Проверяет завершение обхода при циклических зависимостях."""
+    source = write_graph(
+        directory, {"A": ["B"], "B": ["C"], "C": ["A"]}
     )
-    check(result.returncode != 0, "ожидалась ошибка имени пакета")
-
-
-def test_invalid_url() -> None:
-    """Проверяет недопустимую схему URL."""
     result = run_cli(
-        "--package", "demo",
-        "--repository", "ftp://example.com",
-    )
-    check(result.returncode != 0, "ожидалась ошибка URL")
-
-
-def test_missing_file(directory: Path) -> None:
-    """Проверяет отсутствие тестового файла."""
-    missing = directory / "missing.json"
-    result = run_cli(
-        "--package", "demo",
-        "--repository", str(missing),
+        "--package", "A", "--repository", str(source),
         "--test-repository",
     )
-    check(result.returncode != 0, "ожидалась ошибка файла")
-    check("не найден" in result.stderr, "неверное сообщение об ошибке")
-
-
-def test_invalid_output() -> None:
-    """Проверяет недопустимое расширение выходного файла."""
-    result = run_cli(
-        "--package", "demo",
-        "--repository", "https://example.com",
-        "--output", "graph.exe",
-    )
-    check(result.returncode != 0, "ожидалась ошибка расширения")
-
-
-def test_empty_filter() -> None:
-    """Проверяет пустую подстроку фильтра."""
-    result = run_cli(
-        "--package", "demo",
-        "--repository", "https://example.com",
-        "--filter", "",
-    )
-    check(result.returncode != 0, "ожидалась ошибка фильтра")
-
-
-def test_dependencies_from_local_repository(directory: Path) -> None:
-    """Проверяет извлечение прямых зависимостей из индекса APT."""
-    repository = directory / "Packages"
-    repository.write_text(
-        "Package: demo\n"
-        "Version: 1.0\n"
-        "Architecture: amd64\n"
-        "Depends: libc6 (>= 2.35), libssl3 | libssl1.1, zlib1g\n"
-        "Description: demo package\n"
-        "\n"
-        "Package: libc6\n"
-        "Version: 2.35\n"
-        "Architecture: amd64\n"
-        "Description: C library\n"
-        "\n",
-        encoding="utf-8",
-    )
-
-    result = run_cli(
-        "--package", "demo",
-        "--repository", str(repository),
-        "--test-repository",
-    )
-
     check(result.returncode == 0, result.stderr)
-    check("Прямые зависимости пакета demo:" in result.stdout,
-          "нет заголовка зависимостей")
+    check("Количество узлов: 3" in result.stdout, result.stdout)
+    check("C -> A" in result.stdout, "ребро цикла потеряно")
 
-    for dependency in ("libc6", "libssl3", "libssl1.1", "zlib1g"):
-        check(dependency in result.stdout,
-              f"не найдена зависимость {dependency}")
+
+def test_filter(directory: Path) -> None:
+    """Проверяет исключение пакетов по подстроке имени."""
+    source = write_graph(
+        directory,
+        {
+            "A": ["B", "LIB"],
+            "B": ["C"],
+            "C": [],
+            "LIB": [],
+        },)
+    result = run_cli(
+        "--package", "A",
+        "--repository", str(source),
+        "--test-repository",
+        "--filter", "LIB",
+    )
+    check(result.returncode == 0, result.stderr)
+    graph_output = result.stdout.split(
+        "Граф зависимостей:", 1
+    )[-1]
+    check(
+        "LIB" not in graph_output,
+        "пакет LIB не исключён",
+    )
+    check(
+        "B -> C" in graph_output,
+        "остальные зависимости потеряны",
+    )
+    check(
+        "Количество узлов: 3" in graph_output,
+        graph_output,
+    )
+
+
+def test_root_filtered(directory: Path) -> None:
+    """Проверяет ошибку, если фильтр исключает корневой пакет."""
+    source = write_graph(directory, {"ABC": []})
+    result = run_cli(
+        "--package", "ABC", "--repository", str(source),
+        "--test-repository", "--filter", "B",
+    )
+    check(result.returncode == 1, result.stdout)
+    check("исключён фильтром" in result.stderr, result.stderr)
 
 
 def test_package_not_found(directory: Path) -> None:
-    """Проверяет сообщение об отсутствующем пакете."""
-    repository = directory / "Packages"
-    repository.write_text(
-        "Package: another-package\n"
-        "Version: 1.0\n"
-        "Description: test\n\n",
+    """Проверяет ошибку для отсутствующего пакета."""
+    source = write_graph(directory, {"A": []})
+    result = run_cli(
+        "--package", "Z", "--repository", str(source),
+        "--test-repository",
+    )
+    check(result.returncode == 1, result.stdout)
+    check("не найден" in result.stderr, result.stderr)
+
+
+def test_invalid_graph(directory: Path) -> None:
+    """Проверяет запрет имён пакетов в нижнем регистре в JSON."""
+    source = write_graph(directory, {"lowercase": []})
+    result = run_cli(
+        "--package", "A", "--repository", str(source),
+        "--test-repository",
+    )
+    check(result.returncode == 1, result.stdout)
+    check("недопустимое имя" in result.stderr, result.stderr)
+
+
+def test_missing_file(directory: Path) -> None:
+    """Проверяет ошибку при отсутствии локального файла."""
+    source = directory / "missing.json"
+    result = run_cli(
+        "--package", "A", "--repository", str(source),
+        "--test-repository",
+    )
+    check(result.returncode == 1, result.stdout)
+    check("не найден" in result.stderr, result.stderr)
+
+
+def test_local_apt_index(directory: Path) -> None:
+    """Проверяет чтение локального индекса Ubuntu Packages."""
+    source = directory / "Packages"
+    source.write_text(
+        "Package: demo\n"
+        "Depends: libc6 (>= 2.35), libssl3 | libssl1.1, zlib1g\n\n"
+        "Package: libc6\n\n"
+        "Package: libssl3\n\n"
+        "Package: libssl1.1\n\n"
+        "Package: zlib1g\n\n",
         encoding="utf-8",
     )
     result = run_cli(
-        "--package", "missing-package",
-        "--repository", str(repository),
+        "--package", "demo", "--repository", str(source),
         "--test-repository",
     )
-
-    check(result.returncode != 0,
-          "ожидалась ошибка отсутствующего пакета")
-    check("не найден" in result.stderr,
-          "нет сообщения об отсутствующем пакете")
+    check(result.returncode == 0, result.stderr)
+    check("demo -> libc6, libssl3, libssl1.1, zlib1g" in result.stdout,
+          result.stdout)
+    check("Количество узлов: 5" in result.stdout, result.stdout)
 
 
 def test_package_without_dependencies(directory: Path) -> None:
-    """Проверяет пакет без поля Depends."""
-    repository = directory / "Packages"
-    repository.write_text(
-        "Package: standalone\n"
-        "Version: 1.0\n"
-        "Architecture: all\n"
-        "Description: standalone package\n\n",
-        encoding="utf-8",
-    )
-
+    """Проверяет пакет без зависимостей."""
+    source = write_graph(directory, {"A": []})
     result = run_cli(
-        "--package", "standalone",
-        "--repository", str(repository),
+        "--package", "A", "--repository", str(source),
         "--test-repository",
     )
-
     check(result.returncode == 0, result.stderr)
-    check("Прямые зависимости отсутствуют." in result.stdout,
-          "неверная обработка пакета без зависимостей")
+    check("A -> (нет зависимостей)" in result.stdout, result.stdout)
+    check("Количество узлов: 1" in result.stdout, result.stdout)
 
+
+def test_invalid_package() -> None:
+    """Проверяет отклонение имени пакета с пробелом."""
+    result = run_cli(
+        "--package", "bad name", "--repository", "https://example.com",
+    )
+    check(result.returncode != 0, "недопустимое имя было принято")
+
+
+def test_invalid_url() -> None:
+    """Проверяет отклонение URL с неподдерживаемой схемой."""
+    result = run_cli(
+        "--package", "demo", "--repository", "ftp://example.com",
+    )
+    check(result.returncode != 0, "URL FTP был принят")
+
+
+def test_empty_filter() -> None:
+    """Проверяет отклонение пустого фильтра."""
+    result = run_cli(
+        "--package", "demo", "--repository", "https://example.com",
+        "--filter", "",
+    )
+    check(result.returncode != 0, "пустой фильтр был принят")
 
 
 def main() -> int:
     """Выполняет все сценарии тестирования."""
-    with tempfile.TemporaryDirectory() as temp:
-        directory = Path(temp)
-        test_valid_run(directory)
-        test_missing_file(directory)
-        test_dependencies_from_local_repository(directory)
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        test_transitive_dependencies(directory)
+        test_cycle(directory)
+        test_filter(directory)
+        test_root_filtered(directory)
         test_package_not_found(directory)
+        test_invalid_graph(directory)
+        test_missing_file(directory)
+        test_local_apt_index(directory)
         test_package_without_dependencies(directory)
-    test_missing_package()
     test_invalid_package()
     test_invalid_url()
-    test_invalid_output()
     test_empty_filter()
     print("OK: все сценарии пройдены.")
     return 0
