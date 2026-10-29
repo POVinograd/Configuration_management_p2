@@ -1,5 +1,4 @@
 
-#!/usr/bin/env python3
 """Сценарные тесты CLI."""
 
 import subprocess
@@ -7,17 +6,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-APP = ROOT / "src" / "dependency_graph.py"
+root = Path(__file__).resolve().parents[1]
+app = root / "src" / "dependency_graph.py"
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     """Запускает CLI с указанными аргументами."""
     return subprocess.run(
-        [sys.executable, str(APP), *args],
+        [sys.executable, str(app), *args],
         capture_output=True,
         text=True,
-        cwd=ROOT,
+        cwd=root,
     )
 
 
