@@ -1,4 +1,4 @@
-Package: demo
+Package: demo_pkg
 Version: 1.0
 Architecture: amd64
 Depends: libc6 (>= 2.35), zlib1g

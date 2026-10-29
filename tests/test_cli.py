@@ -26,9 +26,20 @@ def check(condition: bool, message: str) -> None:
 
 
 def test_valid_run(directory: Path) -> None:
-    """Проверяет вывод всех параметров."""
-    repository = directory / "repo.json"
-    repository.write_text('{"packages": []}', encoding="utf-8")
+    """Проверяет успешный запуск и вывод всех параметров."""
+    repository = directory / "Packages"
+    repository.write_text(
+        "Package: demo_pkg\n"
+        "Version: 1.0\n"
+        "Architecture: amd64\n"
+        "Depends: libc6\n"
+        "Description: demo package\n\n"
+        "Package: libc6\n"
+        "Version: 2.35\n"
+        "Architecture: amd64\n"
+        "Description: C library\n\n",
+        encoding="utf-8",
+    )
     output = directory / "graph.svg"
     result = run_cli(
         "--package", "demo_pkg",
