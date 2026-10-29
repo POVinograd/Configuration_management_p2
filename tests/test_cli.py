@@ -1,139 +1,128 @@
-"""Tests for CLI configuration parsing and validation."""
-import contextlib
-import io
+
+#!/usr/bin/env python3
+"""Сценарные тесты CLI."""
+
+import subprocess
+import sys
 import tempfile
-import unittest
+from pathlib import Path
 
-from dependency_visualizer.cli import main
-from dependency_visualizer.config import build_parser
+ROOT = Path(__file__).resolve().parents[1]
+APP = ROOT / "src" / "dependency_graph.py"
 
 
-class ConfigTests(unittest.TestCase):
-    """Verify successful configuration output and invalid arguments."""
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    """Запускает CLI с указанными аргументами."""
+    return subprocess.run(
+        [sys.executable, str(APP), *args],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
 
-    def test_valid_local_test_repository_prints_all_values(self):
-        """A valid invocation prints each configurable value."""
-        with tempfile.TemporaryDirectory() as directory:
-            output = io.StringIO()
-            arguments = [
-                "--package", "demo", "--repo", directory,
-                "--test-mode", "true", "--output", "graph.svg",
-                "--ascii", "--filter", "dep",
-            ]
-            with contextlib.redirect_stdout(output):
-                code = main(arguments)
 
-            self.assertEqual(code, 0)
-            expected_values = (
-                "package=demo", "test_mode=True", "output=graph.svg",
-                "ascii=True", "filter=dep",
-                "status=configuration_validated",
-            )
-            for expected in expected_values:
-                self.assertIn(expected, output.getvalue())
+def check(condition: bool, message: str) -> None:
+    """Завершает тест с ошибкой при невыполнении условия."""
+    if not condition:
+        raise AssertionError(message)
 
-    def test_missing_required_argument(self):
-        """Missing repository arguments cause argparse to exit with code 2."""
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(["--package", "demo"])
-        self.assertEqual(error.exception.code, 2)
 
-    def test_invalid_boolean(self):
-        """Unknown boolean spellings are rejected."""
-        arguments = [
-            "--package", "demo", "--repo", "https://example.org",
-            "--test-mode", "sometimes",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
+def test_valid_run(directory: Path) -> None:
+    """Проверяет вывод всех параметров."""
+    repository = directory / "repo.json"
+    repository.write_text('{"packages": []}', encoding="utf-8")
+    output = directory / "graph.svg"
+    result = run_cli(
+        "--package", "demo_pkg",
+        "--repository", str(repository),
+        "--test-repository",
+        "--output", str(output),
+        "--ascii-tree",
+        "--filter", "demo",
+    )
+    check(result.returncode == 0, result.stderr)
+    expected = [
+        "package=demo_pkg",
+        f"repository={repository}",
+        "test_repository=True",
+        f"output={output}",
+        "ascii_tree=True",
+        "filter=demo",
+    ]
+    for line in expected:
+        check(line in result.stdout, f"нет строки: {line}")
 
-    def test_invalid_package_name(self):
-        """Package names containing spaces are rejected."""
-        arguments = [
-            "--package", "invalid name", "--repo", "https://example.org",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
 
-    def test_invalid_repository_url(self):
-        """Unsupported URL schemes are rejected."""
-        arguments = [
-            "--package", "demo", "--repo", "ftp://example.org/repo",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
+def test_missing_package() -> None:
+    """Проверяет отсутствие обязательного имени пакета."""
+    result = run_cli("--repository", "https://example.com")
+    check(result.returncode != 0, "ожидалась ошибка --package")
 
-    def test_output_parent_must_exist(self):
-        """An output path with a missing parent directory is rejected."""
-        arguments = [
-            "--package", "demo", "--repo", "https://example.org",
-            "--output", "missing-directory/graph.svg",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
 
-    def test_missing_local_repository(self):
-        """A path that does not exist is rejected."""
-        arguments = [
-            "--package", "demo", "--repo", "./no-such-repo",
-            "--test-mode", "true",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
+def test_invalid_package() -> None:
+    """Проверяет недопустимые символы в имени пакета."""
+    result = run_cli(
+        "--package", "bad name",
+        "--repository", "https://example.com",
+    )
+    check(result.returncode != 0, "ожидалась ошибка имени пакета")
 
-    def test_invalid_output_extension(self):
-        """Unsupported output extensions are rejected."""
-        arguments = [
-            "--package", "demo", "--repo", "https://example.org",
-            "--output", "graph.exe",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
 
-    def test_empty_filter(self):
-        """An explicitly empty filter is rejected."""
-        arguments = [
-            "--package", "demo", "--repo", "https://example.org",
-            "--filter", "",
-        ]
-        with self.assertRaises(SystemExit) as error:
-            build_parser().parse_args(arguments)
-        self.assertEqual(error.exception.code, 2)
+def test_invalid_url() -> None:
+    """Проверяет недопустимую схему URL."""
+    result = run_cli(
+        "--package", "demo",
+        "--repository", "ftp://example.com",
+    )
+    check(result.returncode != 0, "ожидалась ошибка URL")
 
-    def test_local_repo_requires_test_mode(self):
-        """Local paths require the test mode flag."""
-        with tempfile.TemporaryDirectory() as directory:
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as error:
-                    main(["--package", "demo", "--repo", directory])
-            self.assertEqual(error.exception.code, 2)
-            self.assertIn(
-                "требует --test-mode true", stderr.getvalue()
-            )
 
-    def test_url_rejected_in_test_mode(self):
-        """URLs cannot be paired with the local test mode."""
-        stderr = io.StringIO()
-        arguments = [
-            "--package", "demo", "--repo", "https://example.org",
-            "--test-mode", "true",
-        ]
-        with contextlib.redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as error:
-                main(arguments)
-        self.assertEqual(error.exception.code, 2)
-        self.assertIn(
-            "должен быть локальным каталогом",
-            stderr.getvalue()
-        )
+def test_missing_file(directory: Path) -> None:
+    """Проверяет отсутствие тестового файла."""
+    missing = directory / "missing.json"
+    result = run_cli(
+        "--package", "demo",
+        "--repository", str(missing),
+        "--test-repository",
+    )
+    check(result.returncode != 0, "ожидалась ошибка файла")
+    check("не найден" in result.stderr, "неверное сообщение об ошибке")
+
+
+def test_invalid_output() -> None:
+    """Проверяет недопустимое расширение выходного файла."""
+    result = run_cli(
+        "--package", "demo",
+        "--repository", "https://example.com",
+        "--output", "graph.exe",
+    )
+    check(result.returncode != 0, "ожидалась ошибка расширения")
+
+
+def test_empty_filter() -> None:
+    """Проверяет пустую подстроку фильтра."""
+    result = run_cli(
+        "--package", "demo",
+        "--repository", "https://example.com",
+        "--filter", "",
+    )
+    check(result.returncode != 0, "ожидалась ошибка фильтра")
+
+
+def main() -> int:
+    """Выполняет все сценарии тестирования."""
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        test_valid_run(directory)
+        test_missing_file(directory)
+    test_missing_package()
+    test_invalid_package()
+    test_invalid_url()
+    test_invalid_output()
+    test_empty_filter()
+    print("OK: все сценарии пройдены.")
+    return 0
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(main())

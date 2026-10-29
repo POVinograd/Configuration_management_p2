@@ -1,72 +1,47 @@
-# Dependency Visualizer — этап 1
+# Визуализатор графа зависимостей — этап 1
 
-Минимальный CLI-прототип для настройки будущего инструмента визуализации графа зависимостей Python-пакетов. На первом этапе приложение только валидирует конфигурацию и выводит параметры `ключ=значение`; загрузка репозитория, разрешение зависимостей и построение изображения пока не выполняются.
+Минимальный CLI-прототип на Python 3.10+. На этом этапе приложение проверяет параметры и печатает их в формате `ключ=значение`. Получение зависимостей и визуализация графа пока не реализованы.
 
-## Требования
+## Параметры
 
-- Python 3.10+
-- Сторонние runtime-зависимости отсутствуют.
+| Параметр | Назначение |
+|---|---|
+| `--package` | Имя анализируемого пакета (обязательный) |
+| `--repository` | URL HTTP(S) или путь к файлу тестового репозитория (обязательный) |
+| `--test-repository` | Режим локального тестового репозитория; проверяет, что путь существует и указывает на читаемый файл |
+| `--output` | Имя файла графа; по умолчанию `dependencies.png`; разрешены `.png`, `.svg`, `.jpg`, `.jpeg`, `.pdf` |
+| `--ascii-tree` | Включить ASCII-дерево |
+| `--filter` | Подстрока для фильтрации пакетов |
 
-## Запуск из исходников
+## Примеры
 
-Linux/macOS:
-
-```bash
-./run.sh --package requests --repo https://example.org/repository
-```
-
-Windows (cmd.exe):
-
-```bat
-run.bat --package requests --repo https://example.org/repository
-```
-
-Запуск через `PYTHONPATH` также поддерживается:
+Обычный режим:
 
 ```bash
-PYTHONPATH=src python -m dependency_visualizer.cli \
-  --package requests --repo https://example.org/repository
+python dependency_graph.py --package requests --repository https://pypi.org/simple
 ```
 
-Локальный тестовый репозиторий должен быть существующим каталогом и использоваться вместе с тестовым режимом:
+Тестовый режим:
 
 ```bash
-mkdir -p test_repo
-PYTHONPATH=src python -m dependency_visualizer.cli \
-  --package demo --repo ./test_repo --test-mode true \
-  --output graph.svg --ascii --filter dep
+printf '{"packages": []}' > repo.json
+python dependency_graph.py --package demo --repository repo.json --test-repository --output graph.svg --ascii-tree --filter demo
 ```
 
-`--test-mode` принимает `true/false`, `yes/no`, `да/нет`, `1/0`. URL допускает схемы HTTP, HTTPS и file. Формат выходного файла проверяется, но изображение на этапе 1 не создаётся.
+Успешный запуск печатает все шесть настроек как `ключ=значение`. Ошибочные параметры приводят к ненулевому коду завершения и сообщению об ошибке в `stderr`.
 
-## Опции
-
-- `--package NAME` — обязательное имя пакета.
-- `--repo URL_OR_PATH` — обязательный URL или путь к существующему локальному каталогу.
-- `--test-mode BOOL` — режим тестового репозитория, по умолчанию `false`.
-- `--output FILE` — имя файла изображения, по умолчанию `graph.png`; разрешены `.png`, `.svg`, `.jpg`, `.jpeg`, `.pdf`.
-- `--ascii` — включить режим ASCII-дерева.
-- `--filter SUBSTRING` — фильтрующая подстрока; по умолчанию фильтр не задан.
-
-## Проверки
+## Сценарные тесты (без pytest)
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+python tests/test_cli.py
 ```
 
-Обрабатываются ошибки отсутствующих обязательных аргументов, пустого/некорректного имени пакета, неизвестного или недоступного репозитория, несовместимого режима репозитория, некорректного булева значения, неверного расширения/пути выходного файла и пустого фильтра. `argparse` выводит сообщение об ошибке и завершает CLI с кодом 2.
+## Стандартный коммит
 
-## Коммит этапа 1
+После проверки создайте git-репозиторий (если его ещё нет), добавьте файлы и выполните коммит в стиле Conventional Commits:
 
-Рекомендуемое сообщение коммита по Conventional Commits:
-
-```text
-feat: add configurable dependency visualizer CLI prototype
+```bash
+git init
+git add dependency_graph.py tests/test_cli.py README.md
+git commit -m "feat: add configurable dependency graph CLI prototype"
 ```
-
-## Состав репозитория и стиль
-
-- Исходный код находится в `src/`, тесты — в `tests/`.
-- `run.sh` и `run.bat` предоставляют скрипты запуска без установки пакета.
-- `.gitignore` исключает кэш Python, артефакты сборки, архивы и файлы редакторов.
-- Изменения оформляются коммитами Conventional Commits, например `fix: enforce repository style checks`.
