@@ -11,7 +11,7 @@ if not exist "Packages" (
     goto end
 )
 
-py -3 src\dependency_graph.py --package demo --repository Packages --test-repository
+py -3 src\dependency_graph.py --package nano --repository https://archive.ubuntu.com/ubuntu
 
 echo.
 echo Program finished with code %ERRORLEVEL%
