@@ -229,11 +229,24 @@ def index_urls(repository: str) -> list[str]:
     return urls
 
 
-def find_package(data: str, requested_name: str) -> dict[str, str] | None:
-    """Находит запись пакета по точному имени."""
-    for package in parse_control_data(data):
+def find_package(
+    data: str,
+    requested_name: str,
+) -> dict[str, str] | None:
+    """Находит пакет по имени или по виртуальной зависимости Provides."""
+    records = parse_control_data(data)
+
+    for package in records:
         if package.get("Package") == requested_name:
             return package
+
+    for package in records:
+        provided = package.get("Provides", "")
+        for item in provided.split(","):
+            match = dependency_pattern.match(item)
+            if match and match.group(1) == requested_name:
+                return package
+
     return None
 
 

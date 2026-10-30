@@ -11,7 +11,7 @@ if not exist "Packages" (
     goto end
 )
 
-py -3 src\dependency_graph.py --package demo --repository Packages --test-repository
+py -3 src\dependency_graph.py --package bash --repository https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64
 
 echo.
 echo Program finished with code %ERRORLEVEL%
