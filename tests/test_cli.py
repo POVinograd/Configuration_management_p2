@@ -1,4 +1,3 @@
-
 """Сценарные тесты CLI без pytest."""
 
 import json
@@ -203,6 +202,59 @@ def test_empty_filter() -> None:
     check(result.returncode != 0, "пустой фильтр был принят")
 
 
+
+def test_installation_order(directory: Path) -> None:
+    """Проверяет, что зависимости выводятся раньше зависимых пакетов."""
+    source = write_graph(
+        directory,
+        {"A": ["B", "C"], "B": ["D"], "C": ["D"], "D": []},
+    )
+    result = run_cli(
+        "--package", "A", "--repository", str(source),
+        "--test-repository", "--installation-order",
+    )
+    check(result.returncode == 0, result.stderr)
+    order_output = result.stdout.split(
+        "Порядок установки (сначала зависимости):", 1
+    )[-1]
+    positions = {
+        package: order_output.index(f". {package}")
+        for package in ("A", "B", "C", "D")
+    }
+    check(positions["D"] < positions["B"], order_output)
+    check(positions["D"] < positions["C"], order_output)
+    check(positions["B"] < positions["A"], order_output)
+    check(positions["C"] < positions["A"], order_output)
+    check(order_output.count(". D") == 1, order_output)
+
+
+def test_installation_order_cycle(directory: Path) -> None:
+    """Проверяет обнаружение цикла при формировании порядка установки."""
+    source = write_graph(directory, {"A": ["B"], "B": ["C"], "C": ["A"]})
+    result = run_cli(
+        "--package", "A", "--repository", str(source),
+        "--test-repository", "--installation-order",
+    )
+    check(result.returncode == 0, result.stderr)
+    check("обнаружены циклические зависимости" in result.stdout, result.stdout)
+    order_output = result.stdout.split(
+        "Порядок установки (сначала зависимости):", 1
+    )[-1]
+    for package in ("A", "B", "C"):
+        check(order_output.count(f". {package}") == 1, order_output)
+
+
+def test_installation_order_without_dependencies(directory: Path) -> None:
+    """Проверяет порядок установки одиночного пакета."""
+    source = write_graph(directory, {"A": []})
+    result = run_cli(
+        "--package", "A", "--repository", str(source),
+        "--test-repository", "--installation-order",
+    )
+    check(result.returncode == 0, result.stderr)
+    check("1. A" in result.stdout, result.stdout)
+    check("циклические зависимости" not in result.stdout, result.stdout)
+
 def main() -> int:
     """Выполняет все сценарии тестирования."""
     with tempfile.TemporaryDirectory() as temporary:
@@ -216,6 +268,9 @@ def main() -> int:
         test_missing_file(directory)
         test_local_apt_index(directory)
         test_package_without_dependencies(directory)
+        test_installation_order(directory)
+        test_installation_order_cycle(directory)
+        test_installation_order_without_dependencies(directory)
     test_invalid_package()
     test_invalid_url()
     test_empty_filter()

@@ -11,7 +11,11 @@ if not exist "Packages" (
     goto end
 )
 
-py -3 src\dependency_graph.py --package bash --repository https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64
+echo.
+echo Building dependency graph and calculating installation order...
+echo.
+
+py -3 src\dependency_graph.py --package bash --repository https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64 --installation-order
 
 echo.
 echo Program finished with code %ERRORLEVEL%
@@ -22,4 +26,3 @@ echo Python 3 was not found. Check Python installation.
 
 :end
 pause
-

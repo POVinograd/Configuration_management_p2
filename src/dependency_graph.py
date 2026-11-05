@@ -24,7 +24,6 @@ class RepositoryError(Exception):
 
 
 def package_name(value: str) -> str:
-    """Проверяет имя анализируемого пакета."""
     if not re.fullmatch(package_pattern, value):
         raise argparse.ArgumentTypeError(
             "имя должно содержать латинские буквы, цифры, '.', '_' или '-'"
@@ -33,7 +32,6 @@ def package_name(value: str) -> str:
 
 
 def repository_value(value: str) -> str:
-    """Проверяет URL или путь к репозиторию."""
     if not value.strip():
         raise argparse.ArgumentTypeError(
             "адрес репозитория не может быть пустым"
@@ -49,7 +47,6 @@ def repository_value(value: str) -> str:
 
 
 def filter_value(value: str) -> str:
-    """Проверяет подстроку для фильтрации пакетов."""
     if not value:
         raise argparse.ArgumentTypeError(
             "подстрока фильтрации не может быть пустой"
@@ -58,7 +55,6 @@ def filter_value(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Создаёт парсер аргументов командной строки."""
     parser = argparse.ArgumentParser(
         description="Построение графа зависимостей пакетов."
     )
@@ -78,25 +74,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--filter", dest="package_filter", type=filter_value,
         help="исключить пакеты, содержащие указанную подстроку",
     )
+    parser.add_argument(
+        "--installation-order", action="store_true",
+        help="вывести порядок установки зависимостей (сначала зависимости)",
+    )
     return parser
 
 
 def print_options(args: argparse.Namespace) -> None:
-    """Печатает параметры запуска программы."""
     print(f"package={args.package}")
     print(f"repository={args.repository}")
     print(f"test_repository={args.test_repository}")
     print(f"filter={args.package_filter or ''}")
+    print(f"installation_order={args.installation_order}")
 
 
 def parse_control_data(data: str) -> list[dict[str, str]]:
-    """Разбирает записи Debian control из индекса APT."""
     packages = []
     fields: dict[str, str] = {}
     last_field = None
 
     def save_record() -> None:
-        """Сохраняет текущую запись и очищает поля."""
         if fields:
             packages.append(dict(fields))
             fields.clear()
@@ -121,7 +119,6 @@ def parse_control_data(data: str) -> list[dict[str, str]]:
 
 
 def extract_dependencies(package: dict[str, str]) -> list[str]:
-    """Извлекает имена прямых зависимостей Debian-пакета."""
     dependencies = []
     for field in ("Pre-Depends", "Depends"):
         for group in package.get(field, "").split(","):
@@ -133,7 +130,6 @@ def extract_dependencies(package: dict[str, str]) -> list[str]:
 
 
 def decode_index(raw: bytes, source: str) -> str:
-    """Распаковывает индекс APT с учётом расширения файла."""
     try:
         if source.endswith(".gz"):
             raw = gzip.decompress(raw)
@@ -147,7 +143,6 @@ def decode_index(raw: bytes, source: str) -> str:
 
 
 def read_local_repository(path: str) -> str:
-    """Читает локальный индекс пакетов APT."""
     try:
         raw = Path(path).read_bytes()
     except OSError as exc:
@@ -158,7 +153,6 @@ def read_local_repository(path: str) -> str:
 
 
 def fetch_url(url: str) -> str:
-    """Загружает индекс пакетов по HTTP или HTTPS."""
     request = Request(url, headers={"User-Agent": "dependency-graph/1.0"})
     try:
         with urlopen(request, timeout=15) as response:
@@ -169,7 +163,6 @@ def fetch_url(url: str) -> str:
 
 
 def architecture_name() -> str:
-    """Возвращает архитектуру системы в формате APT."""
     machine = platform.machine().lower()
     return {
         "x86_64": "amd64",
@@ -183,7 +176,6 @@ def architecture_name() -> str:
 
 
 def ubuntu_codename() -> str | None:
-    """Определяет кодовое имя Ubuntu из системных метаданных."""
     try:
         lines = Path("/etc/os-release").read_text(
             encoding="utf-8"
@@ -197,7 +189,6 @@ def ubuntu_codename() -> str | None:
 
 
 def index_urls(repository: str) -> list[str]:
-    """Формирует возможные URL индекса Packages."""
     parsed = urlparse(repository)
     base = repository.rstrip("/")
     filename = parsed.path.rstrip("/").rsplit("/", 1)[-1]
@@ -228,12 +219,10 @@ def index_urls(repository: str) -> list[str]:
                 ])
     return urls
 
-
 def find_package(
     data: str,
     requested_name: str,
 ) -> dict[str, str] | None:
-    """Находит пакет по имени или по виртуальной зависимости Provides."""
     records = parse_control_data(data)
 
     for package in records:
@@ -255,7 +244,6 @@ def get_package_dependencies(
     requested_name: str,
     test_repository: bool = False,
 ) -> list[str]:
-    """Получает прямые зависимости пакета из APT."""
     if test_repository:
         data = read_local_repository(repository)
         package = find_package(data, requested_name)
@@ -284,7 +272,6 @@ def get_package_dependencies(
 
 
 def parse_graph_file(path: str) -> dict[str, list[str]]:
-    """Читает JSON-граф с именами пакетов из больших латинских букв."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -316,7 +303,6 @@ def parse_graph_file(path: str) -> dict[str, list[str]]:
 
 
 def records_to_graph(records: list[dict[str, str]]) -> dict[str, list[str]]:
-    """Преобразует записи APT в словарь зависимостей."""
     graph = {}
     for package in records:
         name = package.get("Package")
@@ -326,7 +312,6 @@ def records_to_graph(records: list[dict[str, str]]) -> dict[str, list[str]]:
 
 
 def load_test_graph(path: str) -> dict[str, list[str]]:
-    """Загружает JSON-граф или локальный индекс Ubuntu Packages."""
     try:
         content = Path(path).read_text(encoding="utf-8").lstrip()
     except OSError as exc:
@@ -371,8 +356,58 @@ def build_dependency_graph(
     return graph
 
 
+def installation_order(
+    graph: dict[str, list[str]],
+) -> tuple[list[str], list[tuple[str, str]]]:
+    state: dict[str, int] = {}  
+    order: list[str] = []
+    cycle_edges: list[tuple[str, str]] = []
+
+    def visit(package: str) -> None:
+        status = state.get(package, 0)
+        if status == 2:
+            return
+        if status == 1:
+            return
+
+        state[package] = 1
+        for dependency in graph.get(package, []):
+            dependency_status = state.get(dependency, 0)
+            if dependency_status == 1:
+                cycle_edges.append((package, dependency))
+            elif dependency_status == 0:
+                visit(dependency)
+
+        state[package] = 2
+        order.append(package)
+
+    for package in graph:
+        if state.get(package, 0) == 0:
+            visit(package)
+    for dependencies in graph.values():
+        for dependency in dependencies:
+            if state.get(dependency, 0) == 0:
+                visit(dependency)
+
+    return order, cycle_edges
+
+
+def print_installation_order(graph: dict[str, list[str]]) -> None:
+    order, cycle_edges = installation_order(graph)
+    print("\nПорядок установки (сначала зависимости):")
+    for number, package in enumerate(order, start=1):
+        print(f"{number}. {package}")
+
+    if cycle_edges:
+        print("\nПредупреждение: обнаружены циклические зависимости:")
+        for package, dependency in cycle_edges:
+            print(f"{package} -> {dependency}")
+        print(
+            "Для пакетов внутри цикла строгий порядок установки "
+            "определить невозможно."
+        )
+
 def print_graph(graph: dict[str, list[str]]) -> None:
-    """Выводит узлы и рёбра графа в текстовом виде."""
     print("\nГраф зависимостей:")
     for package, dependencies in graph.items():
         if dependencies:
@@ -384,7 +419,6 @@ def print_graph(graph: dict[str, list[str]]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Разбирает параметры, строит граф и выводит результат."""
     parser = build_parser()
     args = parser.parse_args(argv)
     print_options(args)
@@ -407,6 +441,8 @@ def main(argv: list[str] | None = None) -> int:
             args.package, provider, args.package_filter or ""
         )
         print_graph(graph)
+        if args.installation_order:
+            print_installation_order(graph)
     except RepositoryError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
