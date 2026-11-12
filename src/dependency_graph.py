@@ -3,7 +3,11 @@ import argparse
 import gzip
 import json
 import lzma
+import os
 import platform
+import shlex
+import shutil
+import subprocess
 import re
 import sys
 from collections import deque
@@ -78,6 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--installation-order", action="store_true",
         help="вывести порядок установки зависимостей (сначала зависимости)",
     )
+    parser.add_argument(
+        "--image-file", default="dependency_graph.png",
+        help="имя PNG-файла с изображением графа",
+    )
+    parser.add_argument(
+        "--ascii-tree", action="store_true",
+        help="вывести зависимости в виде ASCII-дерева",
+    )
     return parser
 
 
@@ -87,6 +99,8 @@ def print_options(args: argparse.Namespace) -> None:
     print(f"test_repository={args.test_repository}")
     print(f"filter={args.package_filter or ''}")
     print(f"installation_order={args.installation_order}")
+    print(f"image_file={args.image_file}")
+    print(f"ascii_tree={args.ascii_tree}")
 
 
 def parse_control_data(data: str) -> list[dict[str, str]]:
@@ -237,6 +251,59 @@ def find_package(
                 return package
 
     return None
+
+
+def make_remote_dependency_provider(repository: str):
+    """Загружает индекс APT один раз и переиспользует его для всех узлов."""
+    package_records: dict[str, dict[str, str]] | None = None
+    provided_records: dict[str, dict[str, str]] | None = None
+
+    def load_index() -> None:
+        nonlocal package_records, provided_records
+        if package_records is not None:
+            return
+
+        errors = []
+        for url in index_urls(repository):
+            try:
+                print(f"Загрузка индекса APT: {url}", flush=True)
+                records = parse_control_data(fetch_url(url))
+                package_records = {}
+                provided_records = {}
+                for record in records:
+                    name = record.get("Package")
+                    if name:
+                        package_records[name] = record
+                    for item in record.get("Provides", "").split(","):
+                        match = dependency_pattern.match(item)
+                        if match:
+                            provided_records.setdefault(match.group(1), record)
+                print(
+                    f"Индекс загружен: {len(package_records)} пакетов. "
+                    "Повторная загрузка для зависимостей не потребуется.",
+                    flush=True,
+                )
+                return
+            except RepositoryError as exc:
+                errors.append(str(exc))
+
+        detail = errors[-1] if errors else "нет доступных URL индекса"
+        raise RepositoryError(f"не удалось загрузить индекс APT: {detail}")
+
+    def provider(requested_name: str) -> list[str]:
+        load_index()
+        assert package_records is not None
+        assert provided_records is not None
+        record = package_records.get(requested_name)
+        if record is None:
+            record = provided_records.get(requested_name)
+        if record is None:
+            raise RepositoryError(
+                f"пакет {requested_name!r} не найден в загруженном индексе"
+            )
+        return extract_dependencies(record)
+
+    return provider
 
 
 def get_package_dependencies(
@@ -418,6 +485,186 @@ def print_graph(graph: dict[str, list[str]]) -> None:
     print(f"Количество рёбер: {sum(map(len, graph.values()))}")
 
 
+
+def plantuml_source(graph: dict[str, list[str]]) -> str:
+    """Формирует PlantUML-описание графа с безопасными алиасами узлов."""
+    lines = [
+        "@startuml",
+        "left to right direction",
+        "skinparam packageStyle rectangle",
+        "skinparam shadowing false",
+    ]
+    aliases = {
+        package: f"node_{number}"
+        for number, package in enumerate(graph, start=1)
+    }
+    for package, alias in aliases.items():
+        label = package.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'object "{label}" as {alias}')
+    for package, dependencies in graph.items():
+        for dependency in dependencies:
+            if dependency not in aliases:
+                alias = f"node_{len(aliases) + 1}"
+                aliases[dependency] = alias
+                label = dependency.replace("\\", "\\\\").replace('"', '\\"')
+                lines.append(f'object "{label}" as {alias}')
+            lines.append(f"{aliases[package]} --> {aliases[dependency]}")
+    lines.append("@enduml")
+    return "\n".join(lines) + "\n"
+
+
+def graphviz_source(graph: dict[str, list[str]]) -> str:
+    """Формирует эквивалентное описание DOT для резервного рендерера."""
+    lines = ["digraph dependencies {", "  rankdir=LR;", "  node [shape=box];"]
+    aliases = {
+        package: f"node_{number}"
+        for number, package in enumerate(graph, start=1)
+    }
+    for package, alias in aliases.items():
+        label = package.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'  {alias} [label="{label}"];')
+    for package, dependencies in graph.items():
+        for dependency in dependencies:
+            if dependency not in aliases:
+                alias = f"node_{len(aliases) + 1}"
+                aliases[dependency] = alias
+                label = dependency.replace("\\", "\\\\").replace('"', '\\"')
+                lines.append(f'  {alias} [label="{label}"];')
+            lines.append(f"  {aliases[package]} -> {aliases[dependency]};")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_graph(
+    graph: dict[str, list[str]],
+    image_file: str,
+) -> tuple[Path, Path]:
+    """Сохраняет PlantUML и PNG; при отсутствии PlantUML использует Graphviz."""
+    image_path = Path(image_file)
+    if image_path.suffix.lower() != ".png":
+        raise RepositoryError(
+            "имя файла изображения должно иметь расширение .png"
+        )
+    if not image_path.parent.exists():
+        raise RepositoryError(
+            f"каталог для изображения не существует: {image_path.parent}"
+        )
+
+    source_path = image_path.with_suffix(".puml")
+    try:
+        source_path.write_text(
+            plantuml_source(graph), encoding="utf-8"
+        )
+    except OSError as exc:
+        raise RepositoryError(
+            f"не удалось сохранить PlantUML-файл: {exc}"
+        ) from exc
+
+    plantuml = shutil.which("plantuml")
+    jar_path = os.environ.get("PLANTUML_JAR")
+    if plantuml:
+        command = [plantuml, "-tpng", "-o", str(image_path.parent.resolve()),
+                   str(source_path.resolve())]
+        expected_png = image_path.parent / f"{source_path.stem}.png"
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise RepositoryError(
+                f"не удалось запустить PlantUML: {exc}"
+            ) from exc
+        if result.returncode == 0 and expected_png.exists():
+            if expected_png.resolve() != image_path.resolve():
+                expected_png.replace(image_path)
+            return source_path, image_path
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RepositoryError(f"PlantUML не смог создать PNG: {detail}")
+
+    if jar_path and Path(jar_path).is_file():
+        try:
+            result = subprocess.run(
+                ["java", "-jar", jar_path, "-tpng", "-o",
+                 str(image_path.parent.resolve()), str(source_path.resolve())],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError as exc:
+            raise RepositoryError(
+                f"не удалось запустить PlantUML: {exc}"
+            ) from exc
+        expected_png = image_path.parent / f"{source_path.stem}.png"
+        if result.returncode == 0 and expected_png.exists():
+            if expected_png.resolve() != image_path.resolve():
+                expected_png.replace(image_path)
+            return source_path, image_path
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RepositoryError(f"PlantUML не смог создать PNG: {detail}")
+
+    dot = shutil.which("dot")
+    if dot:
+        dot_path = image_path.with_suffix(".dot")
+        try:
+            dot_path.write_text(graphviz_source(graph), encoding="utf-8")
+            result = subprocess.run(
+                [dot, "-Tpng", str(dot_path), "-o", str(image_path)],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError as exc:
+            raise RepositoryError(
+                f"не удалось создать PNG через Graphviz: {exc}"
+            ) from exc
+        if result.returncode == 0 and image_path.is_file():
+            print(
+                "Предупреждение: PlantUML не найден; PNG создан "
+                "резервным рендерером Graphviz из того же графа."
+            )
+            return source_path, image_path
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RepositoryError(f"Graphviz не смог создать PNG: {detail}")
+
+    raise RepositoryError(
+        "для PNG нужен PlantUML (команда plantuml или переменная PLANTUML_JAR) "
+        "либо Graphviz (команда dot). PlantUML-описание сохранено."
+    )
+
+
+def print_ascii_tree(
+    graph: dict[str, list[str]],
+    root: str,
+) -> None:
+    """Печатает дерево зависимостей, помечая повторные узлы и циклы."""
+    print("\nДерево зависимостей:")
+    active: set[str] = set()
+    expanded: set[str] = set()
+
+    def visit(package: str, prefix: str, is_last: bool) -> None:
+        connector = "└── " if is_last else "├── "
+        print(f"{prefix}{connector}{package}")
+        if package in active:
+            print(f"{prefix}{'    ' if is_last else '│   '}↳ цикл")
+            return
+        if package in expanded:
+            print(f"{prefix}{'    ' if is_last else '│   '}↳ уже показан")
+            return
+        active.add(package)
+        dependencies = graph.get(package, [])
+        for index, dependency in enumerate(dependencies):
+            visit(
+                dependency,
+                prefix + ("    " if is_last else "│   "),
+                index == len(dependencies) - 1,
+            )
+        active.remove(package)
+        expanded.add(package)
+
+    print(root)
+    active.add(root)
+    dependencies = graph.get(root, [])
+    for index, dependency in enumerate(dependencies):
+        visit(dependency, "", index == len(dependencies) - 1)
+    active.remove(root)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -431,16 +678,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             provider = lambda name: graph_data.get(name, [])
         else:
-            get_package_dependencies(
-                args.repository, args.package, False
-            )
-            provider = lambda name: get_package_dependencies(
-                args.repository, name, False
-            )
+            # Индекс Packages может занимать сотни мегабайт. Загружаем и
+            # разбираем его один раз, а не заново для каждого пакета графа.
+            provider = make_remote_dependency_provider(args.repository)
         graph = build_dependency_graph(
             args.package, provider, args.package_filter or ""
         )
         print_graph(graph)
+        source_path, image_path = render_graph(graph, args.image_file)
+        print(f"PlantUML: {source_path}")
+        print(f"PNG: {image_path}")
+        if args.ascii_tree:
+            print_ascii_tree(graph, args.package)
         if args.installation_order:
             print_installation_order(graph)
     except RepositoryError as exc:
