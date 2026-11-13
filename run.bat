@@ -15,7 +15,7 @@ echo.
 echo Building dependency graph and calculating installation order...
 echo.
 
-py -3 -u src\dependency_graph.py --package bash --repository https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64 --installation-order --ascii-tree --image-file "%~dp0dependency_graph.png"
+py -3 -u src\dependency_graph.py --package coreutils --repository https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64
 
 if exist "%~dp0dependency_graph.png" (
     echo PNG successfully created!

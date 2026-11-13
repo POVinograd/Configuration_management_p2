@@ -1,0 +1,11 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+object "demo" as node_1
+object "libc6" as node_2
+object "zlib1g" as node_3
+node_1 --> node_2 : >= 2.35
+node_1 --> node_3 : >= 1:1.2.13
+node_3 --> node_2 : >= 2.14
+@enduml

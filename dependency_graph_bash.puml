@@ -1,0 +1,44 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+object "bash" as node_1
+object "libc6" as node_2
+object "libtinfo6" as node_3
+object "base-files" as node_4
+object "debianutils" as node_5
+object "libgcc-s1" as node_6
+object "awk" as node_7
+object "libcrypt1" as node_8
+object "gcc-14-base" as node_9
+object "libgmp10" as node_10
+object "libmpfr6" as node_11
+object "libreadline8t64" as node_12
+object "libsigsegv2" as node_13
+object "readline-common" as node_14
+node_1 --> node_2 : >= 2.38
+node_1 --> node_3 : >= 6
+node_1 --> node_4 : >= 2.1.12
+node_1 --> node_5 : >= 5.6-0.1
+node_2 --> node_6
+node_3 --> node_2 : >= 2.34
+node_4 --> node_7
+node_4 --> node_2 : >= 2.34
+node_4 --> node_8 : >= 1:4.4.10-10ubuntu3
+node_5 --> node_2 : >= 2.38
+node_6 --> node_9 : = 14-20240412-0ubuntu1
+node_6 --> node_2 : >= 2.35
+node_7 --> node_2 : >= 2.38
+node_7 --> node_10 : >= 2:6.3.0+dfsg
+node_7 --> node_11 : >= 3.1.3
+node_7 --> node_12 : >= 6.0
+node_7 --> node_13 : >= 2.9
+node_8 --> node_2 : >= 2.38
+node_10 --> node_2 : >= 2.38
+node_11 --> node_2 : >= 2.14
+node_11 --> node_10 : >= 2:6.3.0+dfsg
+node_12 --> node_14
+node_12 --> node_2 : >= 2.38
+node_12 --> node_3 : >= 6
+node_13 --> node_2 : >= 2.4
+@enduml

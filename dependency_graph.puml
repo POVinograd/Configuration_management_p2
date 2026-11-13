@@ -1,0 +1,31 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+object "coreutils" as node_1
+object "libacl1" as node_2
+object "libattr1" as node_3
+object "libc6" as node_4
+object "libgmp10" as node_5
+object "libselinux1" as node_6
+object "libssl3t64" as node_7
+object "libgcc-s1" as node_8
+object "libpcre2-8-0" as node_9
+object "gcc-14-base" as node_10
+node_1 --> node_2 : >= 2.2.23
+node_1 --> node_3 : >= 1:2.4.48
+node_1 --> node_4 : >= 2.38
+node_1 --> node_5 : >= 2:6.3.0+dfsg
+node_1 --> node_6 : >= 3.1~
+node_1 --> node_7 : >= 3.0.0
+node_2 --> node_4 : >= 2.38
+node_3 --> node_4 : >= 2.4
+node_4 --> node_8
+node_5 --> node_4 : >= 2.38
+node_6 --> node_4 : >= 2.38
+node_6 --> node_9 : >= 10.22
+node_7 --> node_4 : >= 2.38
+node_8 --> node_10 : = 14-20240412-0ubuntu1
+node_8 --> node_4 : >= 2.35
+node_9 --> node_4 : >= 2.34
+@enduml

@@ -1,34 +1,126 @@
 """CLI-инструмент для построения графа зависимостей Ubuntu APT."""
 import argparse
 import gzip
+import itertools
 import json
 import lzma
 import os
 import platform
-import shlex
+import re
 import shutil
 import subprocess
-import re
 import sys
 from collections import deque
 from pathlib import Path
+from typing import Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from debversion import (
+    VERSION_CLAUSE,
+    Constraint,
+    Dependency,
+    dependency_from_match,
+    format_constraints,
+    merge_constraints,
+    merge_dependencies,
+    parse_dependency,
+)
 
-package_pattern = r"[A-Za-z0-9][A-Za-z0-9._-]*"
-graph_package_pattern = re.compile(r"^[A-Z]+$")
-url_schemes = {"http", "https"}
-dependency_pattern = re.compile(r"^\s*([a-z0-9][a-z0-9+.-]*)")
+PACKAGE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+GRAPH_PACKAGE_PATTERN = re.compile(r"^[A-Z]+$")
+TEST_DEPENDENCY_PATTERN = re.compile(
+    r"^\s*([A-Z]+)\s*" + VERSION_CLAUSE + r"\s*$"
+)
+WINDOWS_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
+BINARY_DIR_PATTERN = re.compile(r"binary-[A-Za-z0-9_-]+")
+URL_SCHEMES = {"http", "https"}
+DEPENDENCY_FIELDS = ("Pre-Depends", "Depends")
+PACKAGES_NAMES = {"Packages", "Packages.gz", "Packages.xz"}
+DEFAULT_SUITES = ("noble", "jammy", "focal")
+COMPONENTS = ("main", "universe", "restricted", "multiverse")
+ARCHITECTURES = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "i386": "i386",
+    "i686": "i386",
+    "armv7l": "armhf",
+}
+PLANTUML_HEADER = (
+    "@startuml",
+    "left to right direction",
+    "skinparam packageStyle rectangle",
+    "skinparam shadowing false",
+)
+TIMEOUT_SECONDS = 15
+EXIT_OK = 0
+EXIT_ERROR = 1
+SUCCESS = 0
+UNVISITED = 0
+IN_PROGRESS = 1
+DONE = 2
+BRANCH = "├── "
+LAST_BRANCH = "└── "
+PIPE = "│   "
+INDENT = "    "
+
+Provider = Callable[[str], list[Dependency]]
 
 
 class RepositoryError(Exception):
     """Ошибка загрузки или разбора репозитория."""
 
 
+class DependencyGraph:
+    """Граф зависимостей: узлы, рёбра и ограничения версий на рёбрах."""
+
+    def __init__(self, root: str) -> None:
+        self.edges: dict[str, list[str]] = {root: []}
+        self.constraints: dict[tuple[str, str], tuple[Constraint, ...]] = {}
+
+    def add_edge(self, source: str, dependency: Dependency) -> None:
+        """Добавляет ребро source -> dependency с его ограничениями."""
+        self.edges[source].append(dependency.name)
+        key = (source, dependency.name)
+        self.constraints[key] = dependency.constraints
+
+    def iter_edges(self) -> Iterator[tuple[str, str]]:
+        """Перебирает все рёбра графа."""
+        for source, targets in self.edges.items():
+            for target in targets:
+                yield source, target
+
+    def edge_count(self) -> int:
+        """Возвращает количество рёбер."""
+        return sum(map(len, self.edges.values()))
+
+    def edge_label(self, source: str, target: str) -> str:
+        """Возвращает предикат версии на ребре (пустую строку, если нет)."""
+        found = self.constraints.get((source, target), ())
+        return format_constraints(found)
+
+    def edge_text(self, source: str, target: str) -> str:
+        """Возвращает имя зависимости вместе с предикатом версии."""
+        label = self.edge_label(source, target)
+        return f"{target} ({label})" if label else target
+
+    def strictest(self, target: str) -> tuple[Constraint, ...]:
+        """Объединяет ограничения всех входящих рёбер в самые строгие."""
+        collected = [
+            item
+            for (_, end), found in self.constraints.items()
+            if end == target
+            for item in found
+        ]
+        return merge_constraints(collected)
+
+
 def package_name(value: str) -> str:
-    if not re.fullmatch(package_pattern, value):
+    """Проверяет имя пакета из командной строки."""
+    if not re.fullmatch(PACKAGE_PATTERN, value):
         raise argparse.ArgumentTypeError(
             "имя должно содержать латинские буквы, цифры, '.', '_' или '-'"
         )
@@ -36,14 +128,15 @@ def package_name(value: str) -> str:
 
 
 def repository_value(value: str) -> str:
+    """Проверяет URL репозитория или путь к локальному файлу."""
     if not value.strip():
         raise argparse.ArgumentTypeError(
             "адрес репозитория не может быть пустым"
         )
-    if re.match(r"^[A-Za-z]:[\\/]", value) or "://" not in value:
+    if WINDOWS_PATH_PATTERN.match(value) or "://" not in value:
         return value
     parsed = urlparse(value)
-    if parsed.scheme not in url_schemes or not parsed.netloc:
+    if parsed.scheme not in URL_SCHEMES or not parsed.netloc:
         raise argparse.ArgumentTypeError(
             "URL должен начинаться с http:// или https://"
         )
@@ -51,6 +144,7 @@ def repository_value(value: str) -> str:
 
 
 def filter_value(value: str) -> str:
+    """Проверяет подстроку фильтрации."""
     if not value:
         raise argparse.ArgumentTypeError(
             "подстрока фильтрации не может быть пустой"
@@ -58,10 +152,8 @@ def filter_value(value: str) -> str:
     return value
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Построение графа зависимостей пакетов."
-    )
+def add_source_options(parser: argparse.ArgumentParser) -> None:
+    """Добавляет параметры источника данных."""
     parser.add_argument(
         "--package", required=True, type=package_name,
         help="имя анализируемого пакета",
@@ -78,6 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--filter", dest="package_filter", type=filter_value,
         help="исключить пакеты, содержащие указанную подстроку",
     )
+
+
+def add_output_options(parser: argparse.ArgumentParser) -> None:
+    """Добавляет параметры вывода."""
     parser.add_argument(
         "--installation-order", action="store_true",
         help="вывести порядок установки зависимостей (сначала зависимости)",
@@ -90,10 +186,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--ascii-tree", action="store_true",
         help="вывести зависимости в виде ASCII-дерева",
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Создаёт разборщик аргументов командной строки."""
+    parser = argparse.ArgumentParser(
+        description="Построение графа зависимостей пакетов."
+    )
+    add_source_options(parser)
+    add_output_options(parser)
     return parser
 
 
 def print_options(args: argparse.Namespace) -> None:
+    """Выводит все настраиваемые параметры в формате ключ=значение."""
     print(f"package={args.package}")
     print(f"repository={args.repository}")
     print(f"test_repository={args.test_repository}")
@@ -104,11 +210,13 @@ def print_options(args: argparse.Namespace) -> None:
 
 
 def parse_control_data(data: str) -> list[dict[str, str]]:
-    packages = []
+    """Разбирает текст в формате Debian control на список записей."""
+    packages: list[dict[str, str]] = []
     fields: dict[str, str] = {}
     last_field = None
 
     def save_record() -> None:
+        """Сохраняет накопленную запись и очищает буфер."""
         if fields:
             packages.append(dict(fields))
             fields.clear()
@@ -132,44 +240,47 @@ def parse_control_data(data: str) -> list[dict[str, str]]:
     return packages
 
 
-def extract_dependencies(package: dict[str, str]) -> list[str]:
-    dependencies = []
-    for field in ("Pre-Depends", "Depends"):
+def extract_dependencies(package: dict[str, str]) -> list[Dependency]:
+    """Извлекает прямые зависимости с самыми строгими предикатами версий."""
+    items = []
+    for field in DEPENDENCY_FIELDS:
         for group in package.get(field, "").split(","):
             for alternative in group.split("|"):
-                match = dependency_pattern.match(alternative)
-                if match and match.group(1) not in dependencies:
-                    dependencies.append(match.group(1))
-    return dependencies
+                parsed = parse_dependency(alternative)
+                if parsed:
+                    items.append(parsed)
+    return merge_dependencies(items)
 
 
 def decode_index(raw: bytes, source: str) -> str:
+    """Распаковывает (по расширению) и декодирует индекс пакетов."""
     try:
         if source.endswith(".gz"):
             raw = gzip.decompress(raw)
         elif source.endswith(".xz"):
             raw = lzma.decompress(raw)
-        return raw.decode("utf-8")
+        return raw.decode("utf-8-sig")
     except (OSError, EOFError, lzma.LZMAError, UnicodeDecodeError) as exc:
         raise RepositoryError(
             f"не удалось прочитать индекс {source}: {exc}"
         ) from exc
 
 
-def read_local_repository(path: str) -> str:
+def read_file_bytes(path: str) -> bytes:
+    """Читает локальный файл репозитория."""
     try:
-        raw = Path(path).read_bytes()
+        return Path(path).read_bytes()
     except OSError as exc:
         raise RepositoryError(
-            f"не удалось прочитать файл репозитория: {exc}"
+            f"тестовый файл не найден или недоступен: {exc}"
         ) from exc
-    return decode_index(raw, Path(path).name)
 
 
 def fetch_url(url: str) -> str:
+    """Скачивает индекс по URL и возвращает его текст."""
     request = Request(url, headers={"User-Agent": "dependency-graph/1.0"})
     try:
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             raw = response.read()
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         raise RepositoryError(f"не удалось загрузить {url}: {exc}") from exc
@@ -177,19 +288,13 @@ def fetch_url(url: str) -> str:
 
 
 def architecture_name() -> str:
+    """Возвращает имя архитектуры в терминах APT."""
     machine = platform.machine().lower()
-    return {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-        "i386": "i386",
-        "i686": "i386",
-        "armv7l": "armhf",
-    }.get(machine, machine)
+    return ARCHITECTURES.get(machine, machine)
 
 
 def ubuntu_codename() -> str | None:
+    """Возвращает кодовое имя текущего выпуска Ubuntu, если оно известно."""
     try:
         lines = Path("/etc/os-release").read_text(
             encoding="utf-8"
@@ -202,174 +307,141 @@ def ubuntu_codename() -> str | None:
     return None
 
 
-def index_urls(repository: str) -> list[str]:
-    parsed = urlparse(repository)
-    base = repository.rstrip("/")
-    filename = parsed.path.rstrip("/").rsplit("/", 1)[-1]
-    if filename in {"Packages", "Packages.gz", "Packages.xz"}:
-        return [repository]
-    if re.fullmatch(r"binary-[A-Za-z0-9_-]+", filename):
-        return [
-            f"{base}/Packages.xz",
-            f"{base}/Packages.gz",
-            f"{base}/Packages",
-        ]
-    suites = []
-    for suite in (ubuntu_codename(), "noble", "jammy", "focal"):
+def candidate_suites() -> list[str]:
+    """Возвращает список выпусков для поиска индекса без повторов."""
+    suites: list[str] = []
+    for suite in (ubuntu_codename(), *DEFAULT_SUITES):
         if suite and suite not in suites:
             suites.append(suite)
-    urls = []
-    architecture = architecture_name()
-    for suite in suites:
-        for component in ("main", "universe", "restricted", "multiverse"):
-            for arch in (architecture, "all"):
-                folder = (
-                    f"{base}/dists/{suite}/{component}/binary-{arch}"
-                )
-                urls.extend([
-                    f"{folder}/Packages.xz",
-                    f"{folder}/Packages.gz",
-                    f"{folder}/Packages",
-                ])
+    return suites
+
+
+def folder_urls(folder: str) -> list[str]:
+    """Возвращает варианты файла Packages в каталоге binary-*."""
+    return [
+        f"{folder}/Packages.xz",
+        f"{folder}/Packages.gz",
+        f"{folder}/Packages",
+    ]
+
+
+def index_urls(repository: str) -> list[str]:
+    """Строит список URL, по которым может лежать индекс Packages."""
+    base = repository.rstrip("/")
+    filename = urlparse(repository).path.rstrip("/").rsplit("/", 1)[-1]
+    if filename in PACKAGES_NAMES:
+        return [repository]
+    if BINARY_DIR_PATTERN.fullmatch(filename):
+        return folder_urls(base)
+    urls: list[str] = []
+    variants = itertools.product(
+        candidate_suites(), COMPONENTS, (architecture_name(), "all")
+    )
+    for suite, component, arch in variants:
+        folder = f"{base}/dists/{suite}/{component}/binary-{arch}"
+        urls.extend(folder_urls(folder))
     return urls
 
-def find_package(
-    data: str,
-    requested_name: str,
-) -> dict[str, str] | None:
-    records = parse_control_data(data)
 
-    for package in records:
-        if package.get("Package") == requested_name:
-            return package
+class RemoteIndex:
+    """Скачивает индекс APT один раз и отдаёт зависимости любого пакета."""
 
-    for package in records:
-        provided = package.get("Provides", "")
-        for item in provided.split(","):
-            match = dependency_pattern.match(item)
-            if match and match.group(1) == requested_name:
-                return package
+    def __init__(self, repository: str) -> None:
+        self.repository = repository
+        self.loaded = False
+        self.packages: dict[str, dict[str, str]] = {}
+        self.provided: dict[str, dict[str, str]] = {}
 
-    return None
-
-
-def make_remote_dependency_provider(repository: str):
-    """Загружает индекс APT один раз и переиспользует его для всех узлов."""
-    package_records: dict[str, dict[str, str]] | None = None
-    provided_records: dict[str, dict[str, str]] | None = None
-
-    def load_index() -> None:
-        nonlocal package_records, provided_records
-        if package_records is not None:
+    def load(self) -> None:
+        """Загружает первый доступный индекс из списка URL."""
+        if self.loaded:
             return
-
         errors = []
-        for url in index_urls(repository):
+        for url in index_urls(self.repository):
             try:
-                print(f"Загрузка индекса APT: {url}", flush=True)
-                records = parse_control_data(fetch_url(url))
-                package_records = {}
-                provided_records = {}
-                for record in records:
-                    name = record.get("Package")
-                    if name:
-                        package_records[name] = record
-                    for item in record.get("Provides", "").split(","):
-                        match = dependency_pattern.match(item)
-                        if match:
-                            provided_records.setdefault(match.group(1), record)
-                print(
-                    f"Индекс загружен: {len(package_records)} пакетов. "
-                    "Повторная загрузка для зависимостей не потребуется.",
-                    flush=True,
-                )
+                self.fill(url)
                 return
             except RepositoryError as exc:
                 errors.append(str(exc))
-
         detail = errors[-1] if errors else "нет доступных URL индекса"
         raise RepositoryError(f"не удалось загрузить индекс APT: {detail}")
 
-    def provider(requested_name: str) -> list[str]:
-        load_index()
-        assert package_records is not None
-        assert provided_records is not None
-        record = package_records.get(requested_name)
+    def fill(self, url: str) -> None:
+        """Скачивает индекс по url и заполняет словари пакетов."""
+        print(f"Загрузка индекса APT: {url}", flush=True)
+        records = parse_control_data(fetch_url(url))
+        self.packages = {}
+        self.provided = {}
+        for record in records:
+            self.add_record(record)
+        self.loaded = True
+        print(
+            f"Индекс загружен: {len(self.packages)} пакетов. "
+            "Повторная загрузка для зависимостей не потребуется.",
+            flush=True,
+        )
+
+    def add_record(self, record: dict[str, str]) -> None:
+        """Регистрирует запись пакета и его виртуальные имена."""
+        name = record.get("Package")
+        if name:
+            self.packages[name] = record
+        for item in record.get("Provides", "").split(","):
+            parsed = parse_dependency(item)
+            if parsed:
+                self.provided.setdefault(parsed.name, record)
+
+    def __call__(self, requested_name: str) -> list[Dependency]:
+        """Возвращает прямые зависимости пакета из загруженного индекса."""
+        self.load()
+        record = self.packages.get(requested_name)
         if record is None:
-            record = provided_records.get(requested_name)
+            record = self.provided.get(requested_name)
         if record is None:
             raise RepositoryError(
                 f"пакет {requested_name!r} не найден в загруженном индексе"
             )
         return extract_dependencies(record)
 
-    return provider
+
+def parse_test_dependency(owner: str, value: object) -> Dependency:
+    """Разбирает зависимость тестового графа: ``B`` или ``B (>= 1.2)``."""
+    match = None
+    if isinstance(value, str):
+        match = TEST_DEPENDENCY_PATTERN.match(value)
+    if match is None:
+        raise RepositoryError(f"некорректная зависимость пакета {owner}")
+    return dependency_from_match(match)
 
 
-def get_package_dependencies(
-    repository: str,
-    requested_name: str,
-    test_repository: bool = False,
-) -> list[str]:
-    if test_repository:
-        data = read_local_repository(repository)
-        package = find_package(data, requested_name)
-        if package is None:
-            raise RepositoryError(
-                f"пакет {requested_name!r} не найден в тестовом репозитории"
-            )
-        return extract_dependencies(package)
-    errors = []
-    urls = index_urls(repository)
-    for url in urls:
-        try:
-            package = find_package(fetch_url(url), requested_name)
-            if package is not None:
-                return extract_dependencies(package)
-        except RepositoryError as exc:
-            errors.append(str(exc))
-    if errors and len(errors) == len(urls):
-        raise RepositoryError(
-            "не удалось загрузить индексы Packages. "
-            f"Последняя ошибка: {errors[-1]}"
-        )
-    raise RepositoryError(
-        f"пакет {requested_name!r} не найден в доступных индексах"
-    )
+def parse_graph_entry(name: str, dependencies: object) -> list[Dependency]:
+    """Проверяет и разбирает одну запись JSON-графа."""
+    if not GRAPH_PACKAGE_PATTERN.fullmatch(name):
+        raise RepositoryError(f"недопустимое имя пакета: {name!r}")
+    if not isinstance(dependencies, list):
+        raise RepositoryError(f"зависимости {name} должны быть списком")
+    items = [parse_test_dependency(name, value) for value in dependencies]
+    return merge_dependencies(items)
 
 
-def parse_graph_file(path: str) -> dict[str, list[str]]:
+def parse_graph_text(text: str) -> dict[str, list[Dependency]]:
+    """Разбирает JSON-описание тестового графа."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
         raise RepositoryError(f"не удалось прочитать JSON-граф: {exc}") from exc
     if not isinstance(data, dict):
         raise RepositoryError("граф должен быть JSON-объектом")
-    graph = {}
-    for name, dependencies in data.items():
-        if (
-            not isinstance(name, str)
-            or not graph_package_pattern.fullmatch(name)
-        ):
-            raise RepositoryError(
-                f"недопустимое имя пакета: {name!r}"
-            )
-            raise RepositoryError(f"недопустимое имя пакета: {name!r}")
-        if not isinstance(dependencies, list):
-            raise RepositoryError(f"зависимости {name} должны быть списком")
-        for dependency in dependencies:
-            if (
-                not isinstance(dependency, str)
-                or not graph_package_pattern.fullmatch(dependency)
-            ):
-                raise RepositoryError(
-                    f"некорректная зависимость пакета {name}"
-                )
-        graph[name] = list(dict.fromkeys(dependencies))
-    return graph
+    return {
+        name: parse_graph_entry(name, dependencies)
+        for name, dependencies in data.items()
+    }
 
 
-def records_to_graph(records: list[dict[str, str]]) -> dict[str, list[str]]:
+def records_to_graph(
+    records: list[dict[str, str]],
+) -> dict[str, list[Dependency]]:
+    """Преобразует записи control-файла в словарь зависимостей."""
     graph = {}
     for package in records:
         name = package.get("Package")
@@ -378,29 +450,40 @@ def records_to_graph(records: list[dict[str, str]]) -> dict[str, list[str]]:
     return graph
 
 
-def load_test_graph(path: str) -> dict[str, list[str]]:
-    try:
-        content = Path(path).read_text(encoding="utf-8").lstrip()
-    except OSError as exc:
-        raise RepositoryError(
-            f"тестовый файл не найден или недоступен: {exc}"
-        ) from exc
-    if content.startswith("{"):
-        return parse_graph_file(path)
-    return records_to_graph(parse_control_data(read_local_repository(path)))
+def load_test_graph(path: str) -> dict[str, list[Dependency]]:
+    """Загружает тестовый репозиторий: JSON-граф или файл Packages."""
+    text = decode_index(read_file_bytes(path), Path(path).name)
+    if text.lstrip().startswith("{"):
+        return parse_graph_text(text)
+    return records_to_graph(parse_control_data(text))
+
+
+def make_local_provider(graph_data: dict[str, list[Dependency]]) -> Provider:
+    """Создаёт поставщика зависимостей поверх тестового графа."""
+
+    def provider(name: str) -> list[Dependency]:
+        """Возвращает зависимости пакета (пустой список, если их нет)."""
+        return graph_data.get(name, [])
+
+    return provider
+
+
+def is_excluded(name: str, package_filter: str) -> bool:
+    """Проверяет, исключает ли фильтр пакет с данным именем."""
+    return bool(package_filter) and package_filter in name
 
 
 def build_dependency_graph(
     root: str,
-    dependency_provider,
+    dependency_provider: Provider,
     package_filter: str = "",
-) -> dict[str, list[str]]:
+) -> DependencyGraph:
     """Строит граф BFS с рекурсивной обработкой очереди."""
-    if package_filter and package_filter in root:
+    if is_excluded(root, package_filter):
         raise RepositoryError(
             f"корневой пакет {root!r} исключён фильтром {package_filter!r}"
         )
-    graph = {root: []}
+    graph = DependencyGraph(root)
     visited = {root}
     queue = deque([root])
 
@@ -410,13 +493,13 @@ def build_dependency_graph(
             return
         current = queue.popleft()
         for dependency in dependency_provider(current):
-            if package_filter and package_filter in dependency:
+            if is_excluded(dependency.name, package_filter):
                 continue
-            graph[current].append(dependency)
-            if dependency not in visited:
-                visited.add(dependency)
-                graph.setdefault(dependency, [])
-                queue.append(dependency)
+            graph.add_edge(current, dependency)
+            if dependency.name not in visited:
+                visited.add(dependency.name)
+                graph.edges.setdefault(dependency.name, [])
+                queue.append(dependency.name)
         process_queue()
 
     process_queue()
@@ -424,47 +507,38 @@ def build_dependency_graph(
 
 
 def installation_order(
-    graph: dict[str, list[str]],
+    graph: DependencyGraph,
 ) -> tuple[list[str], list[tuple[str, str]]]:
-    state: dict[str, int] = {}  
+    """Возвращает порядок установки (DFS) и рёбра, замыкающие циклы."""
+    state: dict[str, int] = {}
     order: list[str] = []
     cycle_edges: list[tuple[str, str]] = []
 
     def visit(package: str) -> None:
-        status = state.get(package, 0)
-        if status == 2:
+        """Обходит зависимости пакета и добавляет его после них."""
+        if state.get(package, UNVISITED) != UNVISITED:
             return
-        if status == 1:
-            return
-
-        state[package] = 1
-        for dependency in graph.get(package, []):
-            dependency_status = state.get(dependency, 0)
-            if dependency_status == 1:
+        state[package] = IN_PROGRESS
+        for dependency in graph.edges.get(package, []):
+            dependency_state = state.get(dependency, UNVISITED)
+            if dependency_state == IN_PROGRESS:
                 cycle_edges.append((package, dependency))
-            elif dependency_status == 0:
+            else:
                 visit(dependency)
-
-        state[package] = 2
+        state[package] = DONE
         order.append(package)
 
-    for package in graph:
-        if state.get(package, 0) == 0:
-            visit(package)
-    for dependencies in graph.values():
-        for dependency in dependencies:
-            if state.get(dependency, 0) == 0:
-                visit(dependency)
-
+    for package in graph.edges:
+        visit(package)
     return order, cycle_edges
 
 
-def print_installation_order(graph: dict[str, list[str]]) -> None:
+def print_installation_order(graph: DependencyGraph) -> None:
+    """Печатает порядок установки и предупреждение о циклах."""
     order, cycle_edges = installation_order(graph)
     print("\nПорядок установки (сначала зависимости):")
     for number, package in enumerate(order, start=1):
         print(f"{number}. {package}")
-
     if cycle_edges:
         print("\nПредупреждение: обнаружены циклические зависимости:")
         for package, dependency in cycle_edges:
@@ -474,228 +548,263 @@ def print_installation_order(graph: dict[str, list[str]]) -> None:
             "определить невозможно."
         )
 
-def print_graph(graph: dict[str, list[str]]) -> None:
+
+def print_strictest(graph: DependencyGraph) -> None:
+    """Печатает для каждого пакета самые строгие ограничения версий."""
+    print("\nНаиболее строгие ограничения версий:")
+    found = False
+    for package in graph.edges:
+        text = format_constraints(graph.strictest(package))
+        if text:
+            print(f"{package}: {text}")
+            found = True
+    if not found:
+        print("(ограничений версий нет)")
+
+
+def print_graph(graph: DependencyGraph) -> None:
+    """Печатает граф зависимостей с предикатами версий на рёбрах."""
     print("\nГраф зависимостей:")
-    for package, dependencies in graph.items():
-        if dependencies:
-            print(f"{package} -> {', '.join(dependencies)}")
+    for package, targets in graph.edges.items():
+        if targets:
+            items = ", ".join(graph.edge_text(package, t) for t in targets)
+            print(f"{package} -> {items}")
         else:
             print(f"{package} -> (нет зависимостей)")
-    print(f"\nКоличество узлов: {len(graph)}")
-    print(f"Количество рёбер: {sum(map(len, graph.values()))}")
+    print_strictest(graph)
+    print(f"\nКоличество узлов: {len(graph.edges)}")
+    print(f"Количество рёбер: {graph.edge_count()}")
 
 
+def escape_label(text: str) -> str:
+    """Экранирует обратную косую черту и кавычки в подписи."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
-def plantuml_source(graph: dict[str, list[str]]) -> str:
-    """Формирует PlantUML-описание графа с безопасными алиасами узлов."""
-    lines = [
-        "@startuml",
-        "left to right direction",
-        "skinparam packageStyle rectangle",
-        "skinparam shadowing false",
-    ]
-    aliases = {
+
+def node_aliases(graph: DependencyGraph) -> dict[str, str]:
+    """Создаёт безопасные алиасы узлов node_1, node_2, ..."""
+    return {
         package: f"node_{number}"
-        for number, package in enumerate(graph, start=1)
+        for number, package in enumerate(graph.edges, start=1)
     }
+
+
+def plantuml_source(graph: DependencyGraph) -> str:
+    """Формирует PlantUML-описание графа с предикатами версий на рёбрах."""
+    aliases = node_aliases(graph)
+    lines = list(PLANTUML_HEADER)
     for package, alias in aliases.items():
-        label = package.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'object "{label}" as {alias}')
-    for package, dependencies in graph.items():
-        for dependency in dependencies:
-            if dependency not in aliases:
-                alias = f"node_{len(aliases) + 1}"
-                aliases[dependency] = alias
-                label = dependency.replace("\\", "\\\\").replace('"', '\\"')
-                lines.append(f'object "{label}" as {alias}')
-            lines.append(f"{aliases[package]} --> {aliases[dependency]}")
+        lines.append(f'object "{escape_label(package)}" as {alias}')
+    for source, target in graph.iter_edges():
+        label = graph.edge_label(source, target)
+        suffix = f" : {label}" if label else ""
+        lines.append(f"{aliases[source]} --> {aliases[target]}{suffix}")
     lines.append("@enduml")
     return "\n".join(lines) + "\n"
 
 
-def graphviz_source(graph: dict[str, list[str]]) -> str:
+def graphviz_source(graph: DependencyGraph) -> str:
     """Формирует эквивалентное описание DOT для резервного рендерера."""
+    aliases = node_aliases(graph)
     lines = ["digraph dependencies {", "  rankdir=LR;", "  node [shape=box];"]
-    aliases = {
-        package: f"node_{number}"
-        for number, package in enumerate(graph, start=1)
-    }
     for package, alias in aliases.items():
-        label = package.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'  {alias} [label="{label}"];')
-    for package, dependencies in graph.items():
-        for dependency in dependencies:
-            if dependency not in aliases:
-                alias = f"node_{len(aliases) + 1}"
-                aliases[dependency] = alias
-                label = dependency.replace("\\", "\\\\").replace('"', '\\"')
-                lines.append(f'  {alias} [label="{label}"];')
-            lines.append(f"  {aliases[package]} -> {aliases[dependency]};")
+        lines.append(f'  {alias} [label="{escape_label(package)}"];')
+    for source, target in graph.iter_edges():
+        label = escape_label(graph.edge_label(source, target))
+        attributes = f' [label="{label}"]' if label else ""
+        lines.append(
+            f"  {aliases[source]} -> {aliases[target]}{attributes};"
+        )
     lines.append("}")
     return "\n".join(lines) + "\n"
 
 
-def render_graph(
-    graph: dict[str, list[str]],
-    image_file: str,
-) -> tuple[Path, Path]:
-    """Сохраняет PlantUML и PNG; при отсутствии PlantUML использует Graphviz."""
-    image_path = Path(image_file)
-    if image_path.suffix.lower() != ".png":
+def validate_image_path(image_file: str) -> Path:
+    """Проверяет расширение и каталог файла изображения."""
+    path = Path(image_file)
+    if path.suffix.lower() != ".png":
         raise RepositoryError(
             "имя файла изображения должно иметь расширение .png"
         )
-    if not image_path.parent.exists():
+    if not path.parent.exists():
         raise RepositoryError(
-            f"каталог для изображения не существует: {image_path.parent}"
+            f"каталог для изображения не существует: {path.parent}"
         )
+    return path
 
-    source_path = image_path.with_suffix(".puml")
+
+def write_text_file(path: Path, content: str, description: str) -> None:
+    """Записывает текстовый файл, превращая ошибки в RepositoryError."""
     try:
-        source_path.write_text(
-            plantuml_source(graph), encoding="utf-8"
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise RepositoryError(
+            f"не удалось сохранить {description}: {exc}"
+        ) from exc
+
+
+def run_command(command: list[str], tool: str):
+    """Запускает внешнюю программу и возвращает результат."""
+    try:
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False
         )
     except OSError as exc:
         raise RepositoryError(
-            f"не удалось сохранить PlantUML-файл: {exc}"
+            f"не удалось запустить {tool}: {exc}"
         ) from exc
 
+
+def render_with_plantuml(
+    prefix: list[str],
+    source_path: Path,
+    image_path: Path,
+) -> None:
+    """Создаёт PNG из .puml программой PlantUML."""
+    out_dir = str(image_path.parent.resolve())
+    command = [*prefix, "-tpng", "-o", out_dir, str(source_path.resolve())]
+    result = run_command(command, "PlantUML")
+    produced = image_path.parent / f"{source_path.stem}.png"
+    if result.returncode == SUCCESS and produced.exists():
+        if produced.resolve() != image_path.resolve():
+            produced.replace(image_path)
+        return
+    detail = result.stderr.strip() or result.stdout.strip()
+    raise RepositoryError(f"PlantUML не смог создать PNG: {detail}")
+
+
+def render_with_graphviz(
+    dot: str,
+    graph: DependencyGraph,
+    image_path: Path,
+) -> None:
+    """Создаёт PNG через Graphviz, если PlantUML недоступен."""
+    dot_path = image_path.with_suffix(".dot")
+    write_text_file(dot_path, graphviz_source(graph), "DOT-файл")
+    command = [dot, "-Tpng", str(dot_path), "-o", str(image_path)]
+    result = run_command(command, "Graphviz")
+    if result.returncode == SUCCESS and image_path.is_file():
+        print(
+            "Предупреждение: PlantUML не найден; PNG создан "
+            "резервным рендерером Graphviz из того же графа."
+        )
+        return
+    detail = result.stderr.strip() or result.stdout.strip()
+    raise RepositoryError(f"Graphviz не смог создать PNG: {detail}")
+
+
+def render_graph(
+    graph: DependencyGraph,
+    image_file: str,
+) -> tuple[Path, Path]:
+    """Сохраняет PlantUML и PNG; при отсутствии PlantUML — Graphviz."""
+    image_path = validate_image_path(image_file)
+    source_path = image_path.with_suffix(".puml")
+    write_text_file(source_path, plantuml_source(graph), "PlantUML-файл")
     plantuml = shutil.which("plantuml")
     jar_path = os.environ.get("PLANTUML_JAR")
-    if plantuml:
-        command = [plantuml, "-tpng", "-o", str(image_path.parent.resolve()),
-                   str(source_path.resolve())]
-        expected_png = image_path.parent / f"{source_path.stem}.png"
-        try:
-            result = subprocess.run(
-                command, capture_output=True, text=True, check=False
-            )
-        except OSError as exc:
-            raise RepositoryError(
-                f"не удалось запустить PlantUML: {exc}"
-            ) from exc
-        if result.returncode == 0 and expected_png.exists():
-            if expected_png.resolve() != image_path.resolve():
-                expected_png.replace(image_path)
-            return source_path, image_path
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RepositoryError(f"PlantUML не смог создать PNG: {detail}")
-
-    if jar_path and Path(jar_path).is_file():
-        try:
-            result = subprocess.run(
-                ["java", "-jar", jar_path, "-tpng", "-o",
-                 str(image_path.parent.resolve()), str(source_path.resolve())],
-                capture_output=True, text=True, check=False,
-            )
-        except OSError as exc:
-            raise RepositoryError(
-                f"не удалось запустить PlantUML: {exc}"
-            ) from exc
-        expected_png = image_path.parent / f"{source_path.stem}.png"
-        if result.returncode == 0 and expected_png.exists():
-            if expected_png.resolve() != image_path.resolve():
-                expected_png.replace(image_path)
-            return source_path, image_path
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RepositoryError(f"PlantUML не смог создать PNG: {detail}")
-
     dot = shutil.which("dot")
-    if dot:
-        dot_path = image_path.with_suffix(".dot")
-        try:
-            dot_path.write_text(graphviz_source(graph), encoding="utf-8")
-            result = subprocess.run(
-                [dot, "-Tpng", str(dot_path), "-o", str(image_path)],
-                capture_output=True, text=True, check=False,
-            )
-        except OSError as exc:
-            raise RepositoryError(
-                f"не удалось создать PNG через Graphviz: {exc}"
-            ) from exc
-        if result.returncode == 0 and image_path.is_file():
-            print(
-                "Предупреждение: PlantUML не найден; PNG создан "
-                "резервным рендерером Graphviz из того же графа."
-            )
-            return source_path, image_path
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RepositoryError(f"Graphviz не смог создать PNG: {detail}")
-
-    raise RepositoryError(
-        "для PNG нужен PlantUML (команда plantuml или переменная PLANTUML_JAR) "
-        "либо Graphviz (команда dot). PlantUML-описание сохранено."
-    )
+    if plantuml:
+        render_with_plantuml([plantuml], source_path, image_path)
+    elif jar_path and Path(jar_path).is_file():
+        prefix = ["java", "-jar", jar_path]
+        render_with_plantuml(prefix, source_path, image_path)
+    elif dot:
+        render_with_graphviz(dot, graph, image_path)
+    else:
+        raise RepositoryError(
+            "для PNG нужен PlantUML (команда plantuml или переменная "
+            "PLANTUML_JAR) либо Graphviz (команда dot). "
+            "PlantUML-описание сохранено."
+        )
+    return source_path, image_path
 
 
-def print_ascii_tree(
-    graph: dict[str, list[str]],
-    root: str,
-) -> None:
+class TreePrinter:
     """Печатает дерево зависимостей, помечая повторные узлы и циклы."""
+
+    def __init__(self, graph: DependencyGraph) -> None:
+        self.graph = graph
+        self.active: set[str] = set()
+        self.expanded: set[str] = set()
+
+    def show_children(self, package: str, prefix: str) -> None:
+        """Печатает все зависимости пакета с заданным отступом."""
+        targets = self.graph.edges.get(package, [])
+        last_index = len(targets) - 1
+        for index, target in enumerate(targets):
+            self.show_node(package, target, prefix, index == last_index)
+
+    def show_node(
+        self,
+        parent: str,
+        package: str,
+        prefix: str,
+        is_last: bool,
+    ) -> None:
+        """Печатает один узел и рекурсивно его поддерево."""
+        connector = LAST_BRANCH if is_last else BRANCH
+        label = self.graph.edge_text(parent, package)
+        print(f"{prefix}{connector}{label}")
+        child_prefix = prefix + (INDENT if is_last else PIPE)
+        if package in self.active:
+            print(f"{child_prefix}↳ цикл")
+            return
+        if package in self.expanded:
+            print(f"{child_prefix}↳ уже показан")
+            return
+        self.active.add(package)
+        self.show_children(package, child_prefix)
+        self.active.discard(package)
+        self.expanded.add(package)
+
+
+def print_ascii_tree(graph: DependencyGraph, root: str) -> None:
+    """Печатает ASCII-дерево зависимостей от корневого пакета."""
     print("\nДерево зависимостей:")
-    active: set[str] = set()
-    expanded: set[str] = set()
-
-    def visit(package: str, prefix: str, is_last: bool) -> None:
-        connector = "└── " if is_last else "├── "
-        print(f"{prefix}{connector}{package}")
-        if package in active:
-            print(f"{prefix}{'    ' if is_last else '│   '}↳ цикл")
-            return
-        if package in expanded:
-            print(f"{prefix}{'    ' if is_last else '│   '}↳ уже показан")
-            return
-        active.add(package)
-        dependencies = graph.get(package, [])
-        for index, dependency in enumerate(dependencies):
-            visit(
-                dependency,
-                prefix + ("    " if is_last else "│   "),
-                index == len(dependencies) - 1,
-            )
-        active.remove(package)
-        expanded.add(package)
-
+    printer = TreePrinter(graph)
     print(root)
-    active.add(root)
-    dependencies = graph.get(root, [])
-    for index, dependency in enumerate(dependencies):
-        visit(dependency, "", index == len(dependencies) - 1)
-    active.remove(root)
+    printer.active.add(root)
+    printer.show_children(root, "")
+
+
+def make_provider(args: argparse.Namespace) -> Provider:
+    """Выбирает источник зависимостей: тестовый файл или URL."""
+    if not args.test_repository:
+        return RemoteIndex(args.repository)
+    graph_data = load_test_graph(args.repository)
+    if args.package not in graph_data:
+        raise RepositoryError(
+            f"пакет {args.package!r} не найден в тестовом файле"
+        )
+    return make_local_provider(graph_data)
+
+
+def run(args: argparse.Namespace) -> None:
+    """Выполняет все этапы: граф, изображение, дерево, порядок."""
+    graph = build_dependency_graph(
+        args.package, make_provider(args), args.package_filter or ""
+    )
+    print_graph(graph)
+    source_path, image_path = render_graph(graph, args.image_file)
+    print(f"PlantUML: {source_path}")
+    print(f"PNG: {image_path}")
+    if args.ascii_tree:
+        print_ascii_tree(graph, args.package)
+    if args.installation_order:
+        print_installation_order(graph)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    """Точка входа: разбирает аргументы и запускает построение графа."""
+    args = build_parser().parse_args(argv)
     print_options(args)
     try:
-        if args.test_repository:
-            graph_data = load_test_graph(args.repository)
-            if args.package not in graph_data:
-                raise RepositoryError(
-                    f"пакет {args.package!r} не найден в тестовом файле"
-                )
-            provider = lambda name: graph_data.get(name, [])
-        else:
-            # Индекс Packages может занимать сотни мегабайт. Загружаем и
-            # разбираем его один раз, а не заново для каждого пакета графа.
-            provider = make_remote_dependency_provider(args.repository)
-        graph = build_dependency_graph(
-            args.package, provider, args.package_filter or ""
-        )
-        print_graph(graph)
-        source_path, image_path = render_graph(graph, args.image_file)
-        print(f"PlantUML: {source_path}")
-        print(f"PNG: {image_path}")
-        if args.ascii_tree:
-            print_ascii_tree(graph, args.package)
-        if args.installation_order:
-            print_installation_order(graph)
+        run(args)
     except RepositoryError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 if __name__ == "__main__":
